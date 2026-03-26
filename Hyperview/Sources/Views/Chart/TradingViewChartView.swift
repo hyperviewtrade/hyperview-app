@@ -218,21 +218,9 @@ struct TradingViewChartView: UIViewRepresentable {
         private func handleResolveSymbolHL(_ symbol: String, requestId: Int) {
             let vm = chartVM
 
-            // Use Hyperliquid's szDecimals to compute exact price precision
-            let isSpot = symbol.hasPrefix("@") || symbol.contains("/")
-            let baseCoin: String = {
-                if symbol.hasPrefix("@") { return symbol }
-                if let slash = symbol.firstIndex(of: "/") { return String(symbol[..<slash]) }
-                if symbol.contains(":") {
-                    let parts = symbol.split(separator: ":", maxSplits: 1)
-                    return parts.count > 1 ? String(parts[1]) : symbol
-                }
-                return symbol
-            }()
-
-            let szDec = MarketsViewModel.szDecimals(for: baseCoin)
-            let maxBase = isSpot ? 8 : 6
-            let priceDecimals = max(0, min(maxBase - szDec, 8))
+            // Use 5 significant figures for price precision — matches HL display
+            let currentPrice = vm?.livePrice ?? 0
+            let priceDecimals = Market.sigFigDecimals(currentPrice)
             let pricescale = Int(pow(10.0, Double(priceDecimals)))
 
             let displayName = vm?.displayName ?? symbol

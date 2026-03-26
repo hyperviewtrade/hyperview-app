@@ -250,14 +250,26 @@ struct Market: Identifiable {
         return String(format: "%.0f", v)
     }
 
-    /// Price decimals derived from szDecimals — matches Hyperliquid's display precision.
+    /// Price decimals using 5 significant figures — matches Hyperliquid's display precision.
     var priceDecimals: Int {
-        let maxBase = isSpot ? 8 : 6
-        return max(0, min(maxBase - asset.szDecimals, 8))
+        Self.sigFigDecimals(price)
     }
 
     func format(_ p: Double) -> String {
-        return String(format: "%.\(priceDecimals)f", p)
+        return String(format: "%.\(Self.sigFigDecimals(p))f", p)
+    }
+
+    /// Compute the number of decimal places to display for a given price using 5 significant figures.
+    /// This matches Hyperliquid's native display precision across perps, spot, and HIP-3 markets.
+    static func sigFigDecimals(_ price: Double, sigFigs: Int = 5) -> Int {
+        let p = abs(price)
+        guard p > 0 else { return 2 }
+        let magnitude = Int(floor(log10(p)))  // e.g., 68265→4, 86→1, 0.09→-2
+        let intDigits = magnitude + 1          // digits before decimal point
+        if intDigits >= sigFigs {
+            return 0
+        }
+        return sigFigs - intDigits
     }
 }
 

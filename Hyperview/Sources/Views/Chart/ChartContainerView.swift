@@ -295,30 +295,14 @@ struct ChartContainerView: View {
     // MARK: - Formatters
 
     private func formatPrice(_ p: Double) -> String {
-        // Use szDecimals-derived precision for Hyperliquid markets (matches chart Y-axis)
+        // Use 5 significant figures for Hyperliquid markets (matches HL display precision)
         if !chartVM.isCustomTVChart {
-            let symbol = chartVM.selectedSymbol
-            let isSpot = symbol.hasPrefix("@") || symbol.contains("/")
-            let baseCoin: String = {
-                if symbol.hasPrefix("@") { return symbol }
-                if let slash = symbol.firstIndex(of: "/") { return String(symbol[..<slash]) }
-                if symbol.contains(":") {
-                    let parts = symbol.split(separator: ":", maxSplits: 1)
-                    return parts.count > 1 ? String(parts[1]) : symbol
-                }
-                return symbol
-            }()
-            let szDec = MarketsViewModel.szDecimals(for: baseCoin)
-            let maxBase = isSpot ? 8 : 6
-            let decimals = max(0, min(maxBase - szDec, 8))
+            let decimals = Market.sigFigDecimals(p)
             return String(format: "%.\(decimals)f", p)
         }
-        // Fallback for custom TradingView charts
-        if p >= 10_000 { return String(format: "%.1f", p) }
-        if p >= 1_000  { return String(format: "%.2f", p) }
-        if p >= 1      { return String(format: "%.4f", p) }
-        if p >= 0.01   { return String(format: "%.5f", p) }
-        return String(format: "%.8f", p)
+        // Fallback for custom TradingView charts — also use 5 sig figs for consistency
+        let decimals = Market.sigFigDecimals(p)
+        return String(format: "%.\(decimals)f", p)
     }
 
     private func formatVolume(_ v: Double) -> String {

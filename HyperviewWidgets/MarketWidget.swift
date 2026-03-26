@@ -33,15 +33,18 @@ struct WidgetMarket: Identifiable {
     }
 
     var formattedPrice: String {
-        if let dec = priceDecimals {
-            return "$" + String(format: "%.\(dec)f", price)
-        }
-        // Fallback for custom TV charts (no szDecimals available)
-        if price >= 10_000 { return String(format: "$%.0f", price) }
-        if price >= 1_000  { return String(format: "$%.1f", price) }
-        if price >= 1      { return String(format: "$%.2f", price) }
-        if price >= 0.01   { return String(format: "$%.4f", price) }
-        return String(format: "$%.6f", price)
+        let dec = priceDecimals ?? WidgetMarket.sigFigDecimals(price)
+        return "$" + String(format: "%.\(dec)f", price)
+    }
+
+    /// 5 significant figures — matches Hyperliquid's display precision.
+    static func sigFigDecimals(_ price: Double, sigFigs: Int = 5) -> Int {
+        let p = abs(price)
+        guard p > 0 else { return 2 }
+        let magnitude = Int(floor(log10(p)))
+        let intDigits = magnitude + 1
+        if intDigits >= sigFigs { return 0 }
+        return sigFigs - intDigits
     }
 
     var formattedChange: String {
