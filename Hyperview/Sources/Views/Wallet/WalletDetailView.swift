@@ -109,10 +109,12 @@ struct WalletDetailView: View {
                 if vm.isLoading && !vm.hasData {
                     WalletLoadingView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .onAppear { print("⏱ [VIEW] LOADING SPINNER VISIBLE") }
                 } else if let err = vm.errorMsg, !vm.hasData {
                     errorView(err)
                 } else {
                     tabContent
+                        .onAppear { print("⏱ [VIEW] TAB CONTENT VISIBLE  tab=\(tab.rawValue)") }
                 }
             }
             .contentShape(Rectangle())

@@ -72,6 +72,12 @@ struct TrackSearchResultsView: View {
             // Only fetch the default tab on first appear
             guard notLarpsVM.results.isEmpty else { return }
             await performSearch(for: .notLarps, reset: true)
+
+            // Prefetch the other tab's first page in background so tab switch is instant.
+            // Guards: only if the other VM has no results and isn't already loading.
+            if larpsVM.results.isEmpty && !larpsVM.isLoadingMore {
+                await performSearch(for: .larps, reset: true)
+            }
         }
         .navigationDestination(isPresented: Binding(
             get: { walletToShow != nil },

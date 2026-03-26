@@ -312,8 +312,17 @@ final class WalletDetailViewModel: ObservableObject {
 
     private static let backendBaseURL = "https://hyperview-backend-production-075c.up.railway.app"
 
+    /// Shared timing origin for the current load cycle.
+    private var loadT0: CFAbsoluteTime = 0
+
+    private func elapsed() -> String {
+        String(format: "%.0fms", (CFAbsoluteTimeGetCurrent() - loadT0) * 1000)
+    }
+
     private func load(address: String, forceRefresh: Bool = false) async {
         guard !isLoading else { return }
+        loadT0 = CFAbsoluteTimeGetCurrent()
+        print("⏱ [\(elapsed())] WALLET LOAD START  address=\(address.prefix(10))…")
         isLoading = true
         errorMsg  = nil
 
@@ -336,6 +345,7 @@ final class WalletDetailViewModel: ObservableObject {
             alias = cached.alias
             hasFetched = true
             isLoading = false
+            print("⏱ [\(elapsed())] WALLET CACHE HIT — skipping network")
             return
         }
 
@@ -345,10 +355,12 @@ final class WalletDetailViewModel: ObservableObject {
 
         do {
             // Try backend aggregate endpoint first (1 request instead of 7)
+            print("⏱ [\(elapsed())] WALLET TRYING BACKEND")
             let didLoadFromBackend = await loadFromBackend(address: address)
 
             if !didLoadFromBackend {
                 // Fallback: progressive HL API loading
+                print("⏱ [\(elapsed())] WALLET BACKEND FAILED — falling back to HL API")
                 await loadFromHLAPI(address: address)
             }
         } catch is CancellationError {
@@ -362,6 +374,7 @@ final class WalletDetailViewModel: ObservableObject {
         _ = await tokenNamesTask
         _ = await aliasTask
         isLoading = false
+        print("⏱ [\(elapsed())] WALLET LOAD COMPLETE  isLoading=false")
 
         // Cache the loaded data (only if we got meaningful data)
         if !spotBalances.isEmpty || !positions.isEmpty || !fills.isEmpty {
@@ -398,15 +411,22 @@ final class WalletDetailViewModel: ObservableObject {
 
         do {
             var request = URLRequest(url: url)
-            request.timeoutInterval = 4 // fail fast, fallback to direct API
+            request.timeoutInterval = 1.5 // fail fast, fallback to direct API
 
+            print("⏱ [\(elapsed())] BACKEND REQUEST START")
             let (data, response) = try await URLSession.shared.data(for: request)
+            print("⏱ [\(elapsed())] BACKEND RESPONSE RECEIVED  bytes=\(data.count)")
 
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return false }
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                print("⏱ [\(elapsed())] BACKEND BAD STATUS \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+                return false
+            }
+
+            print("⏱ [\(elapsed())] BACKEND JSON PARSE START")
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            print("⏱ [\(elapsed())] BACKEND JSON PARSE END")
 
             // Backend returns null for state/fills/ledger when HL API is rate-limited
-            // In that case, fall back to direct API calls
             guard let state = json["state"] as? [String: Any],
                   state["assetPositions"] != nil || state["marginSummary"] != nil
             else { return false }
@@ -429,60 +449,107 @@ final class WalletDetailViewModel: ObservableObject {
             if let backendAlias = json["alias"] as? String, !backendAlias.isEmpty {
                 self.alias = backendAlias
             } else {
-                // Fallback to AliasCache
                 self.alias = AliasCache.shared.alias(for: address)
             }
 
+            // ── Phase 1: above-the-fold (positions, orders) ──
+            print("⏱ [\(elapsed())] MIDPRICES FETCH START (async)")
+            async let midPriceTask: () = fetchMidPrices()
+
+            print("⏱ [\(elapsed())] PARSE POSITIONS START")
             parsePositions(from: state)
-            // HIP-3 perp positions from backend
+            print("⏱ [\(elapsed())] PARSE POSITIONS END  count=\(positions.count)")
+
             if let hip3 = json["hip3States"] as? [String: [String: Any]] {
+                print("⏱ [\(elapsed())] PARSE HIP3 START  keys=\(hip3.count)")
                 for (_, dexState) in hip3 {
                     parseHIP3Positions(from: dexState)
                 }
+                print("⏱ [\(elapsed())] PARSE HIP3 END")
             }
+
+            print("⏱ [\(elapsed())] PARSE ORDERS START")
             parseOrders(from: state)
-            parseFills(rawFills)
-            // Fetch live prices before parsing spot (for accurate USD valuation)
-            await fetchMidPrices()
+            print("⏱ [\(elapsed())] PARSE ORDERS END  count=\(openOrders.count)")
+
+            hasFetched = true  // UI renders NOW — positions + orders visible
+            print("⏱ [\(elapsed())] ✅ hasFetched = true (UI can render)")
+
+            // ── Phase 2: secondary data (non-blocking for initial render) ──
+            print("⏱ [\(elapsed())] MIDPRICES AWAIT START")
+            await midPriceTask
+            print("⏱ [\(elapsed())] MIDPRICES AWAIT END")
+
+            print("⏱ [\(elapsed())] PARSE SPOT START")
             parseSpot(spot)
+            print("⏱ [\(elapsed())] PARSE SPOT END  count=\(spotBalances.count)")
+
+            print("⏱ [\(elapsed())] PARSE FILLS START  raw=\(rawFills.count)")
+            parseFills(rawFills)
+            print("⏱ [\(elapsed())] PARSE FILLS END  count=\(fills.count)")
+
+            print("⏱ [\(elapsed())] COMPUTE OVERVIEW START")
             computeOverview()
+            print("⏱ [\(elapsed())] COMPUTE OVERVIEW END")
+
+            print("⏱ [\(elapsed())] PARSE TRANSACTIONS START  raw=\(ledger.count)")
             parseTransactions(ledger)
+            print("⏱ [\(elapsed())] PARSE TRANSACTIONS END  count=\(transactions.count)")
+
+            print("⏱ [\(elapsed())] MERGE FILLS INTO TX START")
             mergeFillsIntoTransactions()
+            print("⏱ [\(elapsed())] MERGE FILLS INTO TX END  total=\(transactions.count)")
+
+            print("⏱ [\(elapsed())] PARSE STAKING START")
             parseStaking(summary: stakeSum, delegations: delegs, rewards: rewards)
-            hasFetched = true
+            print("⏱ [\(elapsed())] PARSE STAKING END")
 
             // Background: paginate older fills
             let capturedLedger = ledger
             Task { [weak self] in
                 await self?.paginateOlderFills(address: address, ledger: capturedLedger)
             }
+            print("⏱ [\(elapsed())] BACKEND PATH COMPLETE")
             return true
         } catch {
+            print("⏱ [\(elapsed())] BACKEND ERROR: \(error)")
             return false
         }
     }
 
     /// Fallback: progressive HL API loading.
-    /// Phase 1: positions + spot (instant display)
-    /// Phase 2: fills, staking, HIP-3 (background)
+    /// Phase 1: positions + orders (instant display)
+    /// Phase 2: spot + fills, staking, HIP-3 (background)
     private func loadFromHLAPI(address: String) async {
         // ── Phase 1: essential data (positions, orders, spot) ──
         do {
+            print("⏱ [\(elapsed())] HLAPI PHASE1 START (state + spot + midPrices)")
             async let stateTask = api.fetchUserState(address: address)
             async let spotTask  = api.fetchSpotState(address: address)
+            async let midTask: () = fetchMidPrices()
 
             let state = try await stateTask
-            let spot  = (try? await spotTask) ?? [:]
+            print("⏱ [\(elapsed())] HLAPI STATE RECEIVED")
 
             parsePositions(from: state)
+            print("⏱ [\(elapsed())] HLAPI PARSE POSITIONS END  count=\(positions.count)")
             parseOrders(from: state)
-            await fetchMidPrices()
+            print("⏱ [\(elapsed())] HLAPI PARSE ORDERS END  count=\(openOrders.count)")
+            hasFetched = true
+            print("⏱ [\(elapsed())] ✅ hasFetched = true (UI can render)")
+
+            let spot = (try? await spotTask) ?? [:]
+            print("⏱ [\(elapsed())] HLAPI SPOT RECEIVED")
+            await midTask
+            print("⏱ [\(elapsed())] HLAPI MIDPRICES DONE")
             parseSpot(spot)
             computeOverview()
-            hasFetched = true
+            print("⏱ [\(elapsed())] HLAPI PHASE1 COMPLETE")
 
             // ── Phase 2: secondary data (awaited so isLoading stays true) ──
+            print("⏱ [\(elapsed())] HLAPI PHASE2 START (fills, staking, HIP3)")
             await loadSecondaryData(address: address)
+            print("⏱ [\(elapsed())] HLAPI PHASE2 COMPLETE")
         } catch {
             errorMsg = error.localizedDescription
         }
