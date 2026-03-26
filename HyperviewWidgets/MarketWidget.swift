@@ -783,6 +783,14 @@ private enum SharedMarketReader {
         let mids = await midsTask
         let hip3Prices = await hip3Task
 
+        // XYZ debug: log what hip3Prices contains
+        let xyzKeys = hip3Prices.keys.filter { $0.hasPrefix("xyz") }
+        if !xyzKeys.isEmpty {
+            print("[XYZ RESPONSE KEYS] hip3Prices contains \(xyzKeys.count) xyz keys: \(xyzKeys.sorted().joined(separator: ", "))")
+        } else if hasHIP3 {
+            print("[XYZ RESPONSE KEYS] hip3Prices has NO xyz keys! All keys: \(hip3Prices.keys.sorted().prefix(20).joined(separator: ", "))")
+        }
+
         var result: [String: (price: Double, change: Double, volume: Double)] = [:]
 
         for m in markets {
@@ -796,6 +804,11 @@ private enum SharedMarketReader {
             // HIP-3: from backend/HL DEX
             if price == nil, let hip3 = hip3Prices[m.symbol] ?? hip3Prices[m.name], hip3 > 0 {
                 price = hip3
+            }
+
+            // XYZ debug: log lookup result for HIP-3 markets
+            if m.symbol.contains(":") {
+                print("[XYZ WIDGET LOOKUP KEY] symbol=\(m.symbol) name=\(m.name) → mids[\(m.symbol)]=\(mids[m.symbol] ?? "nil") hip3[\(m.symbol)]=\(hip3Prices[m.symbol].map { String($0) } ?? "nil") hip3[\(m.name)]=\(hip3Prices[m.name].map { String($0) } ?? "nil") → finalPrice=\(price.map { String($0) } ?? "nil")")
             }
 
             if let price, price > 0 {
@@ -838,6 +851,7 @@ private enum SharedMarketReader {
             suffix += "&dexes=\(neededDexes.sorted().joined(separator: ","))"
         }
         if let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/all-prices\(suffix)") {
+            print("[XYZ REFRESH URL] \(url.absoluteString)")
             var request = URLRequest(url: url, timeoutInterval: 12)
             if fresh { request.cachePolicy = .reloadIgnoringLocalCacheData }
             if let (data, resp) = try? await URLSession.shared.data(for: request),
@@ -875,9 +889,12 @@ private enum SharedMarketReader {
                           let ctxs = arr[1] as? [[String: Any]] else { return [:] }
                     var prices: [String: Double] = [:]
                     for (i, asset) in meta.enumerated() where i < ctxs.count {
-                        if let name = asset["name"] as? String,
+                        if let rawName = asset["name"] as? String,
                            let markPx = ctxs[i]["markPx"] as? String,
                            let price = Double(markPx), price > 0 {
+                            // Normalize: HL API may return unprefixed names for some DEXes.
+                            // Must prefix with "dex:" to match widget symbol keys (e.g. "xyz:WTIOIL").
+                            let name = rawName.contains(":") ? rawName : "\(dex):\(rawName)"
                             prices[name] = price
                         }
                     }
@@ -954,6 +971,10 @@ struct RefreshMarketsIntent: AppIntent {
                   let volume = dict["v"] as? Double else { return nil }
             let symbol = dict["s"] as? String ?? name
             let iconName = dict["icon"] as? String ?? name
+            // XYZ debug: log raw stored data for HIP-3 markets
+            if symbol.contains(":") {
+                print("[XYZ WIDGET RAW SYMBOL] name(n)=\(name) symbol(s)=\(symbol) price=\(price)")
+            }
             return WidgetMarket(name: name, symbol: symbol, price: price, change24h: change,
                                 volume24h: volume, iconData: nil, iconName: iconName)
         }
@@ -969,9 +990,16 @@ struct RefreshMarketsIntent: AppIntent {
         if !freshPrices.isEmpty {
             for i in arr.indices {
                 if let name = arr[i]["n"] as? String, let fresh = freshPrices[name] {
+                    let sym = arr[i]["s"] as? String ?? ""
+                    if sym.contains(":") {
+                        let oldPrice = arr[i]["p"] as? Double ?? 0
+                        print("[XYZ FINAL WRITTEN PRICE] name=\(name) symbol=\(sym) old=\(oldPrice) → new=\(fresh.price)")
+                    }
                     arr[i]["p"] = fresh.price
                     arr[i]["c"] = fresh.change
                     arr[i]["v"] = fresh.volume
+                } else if let name = arr[i]["n"] as? String, let sym = arr[i]["s"] as? String, sym.contains(":") {
+                    print("[XYZ FINAL WRITTEN PRICE] MISS — name=\(name) symbol=\(sym) not found in freshPrices (keys: \(freshPrices.keys.filter { $0.contains(":") }.sorted().joined(separator: ", ")))")
                 }
             }
             defaults.set(arr, forKey: "widget_shared_markets")
