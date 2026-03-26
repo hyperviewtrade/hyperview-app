@@ -234,8 +234,35 @@ final class WalletDetailViewModel: ObservableObject {
     @Published var staking:      StakingSummary      = StakingSummary()
     @Published var alias:        String?             = nil
 
+    // MARK: - Transaction pagination (LARP-style)
+    //
+    // Ledger events (deposits/withdrawals/transfers/staking) are always fully loaded.
+    // Fills (trades) are paginated — backend returns first 50, iOS fetches more on demand.
+    // The combined transactions array is sorted by time desc; txDisplayLimit controls
+    // how many the view reveals.
+    @Published var txDisplayLimit: Int = 50
+    @Published var txTotalFills:  Int = 0          // from backend fillsTotal (may exceed fills.count)
+    @Published var txIsLoadingMore: Bool = false
+    private var txLoadAddress: String = ""         // address for load-more calls
+    /// Number of ledger-sourced transactions (always fully loaded, set after parse).
+    private var txParsedLedgerCount: Int = 0
+
+    /// Total known transactions = parsed ledger tx + total fills from backend.
+    /// Ledger is always fully loaded; fills may have more on the server.
+    var txTotalCount: Int {
+        txParsedLedgerCount + txTotalFills
+    }
+
+    /// True when the user can load more: either we have un-revealed parsed data,
+    /// or the server has more fills than we've fetched so far.
+    var txHasMore: Bool {
+        transactions.count > txDisplayLimit || fills.count < txTotalFills
+    }
+
+    /// Paginated + filtered view of transactions.
     var filteredTransactions: [WalletTransaction] {
-        transactions.filter { selectedTxTypes.contains($0.type) }
+        let limited = Array(transactions.prefix(txDisplayLimit))
+        return limited.filter { selectedTxTypes.contains($0.type) }
     }
 
     var hasData: Bool {
@@ -325,6 +352,9 @@ final class WalletDetailViewModel: ObservableObject {
         print("⏱ [\(elapsed())] WALLET LOAD START  address=\(address.prefix(10))…")
         isLoading = true
         errorMsg  = nil
+        txDisplayLimit = 50
+        txTotalFills   = 0
+        txParsedLedgerCount = 0
 
         let cacheKey = address.lowercased()
 
@@ -436,6 +466,11 @@ final class WalletDetailViewModel: ObservableObject {
             let ledger   = json["ledger"] as? [[String: Any]] ?? []
             let staking  = json["staking"] as? [String: Any] ?? [:]
 
+            // Transaction pagination: backend returns fillsTotal (fills may be sliced)
+            // Ledger is always returned in full — txParsedLedgerCount is set by parseTransactions.
+            txTotalFills  = (json["fillsTotal"] as? Int) ?? rawFills.count
+            txLoadAddress = address
+
             let stakeSum = staking["summary"] as? [String: Any] ?? [:]
             let delegs   = staking["delegations"] as? [[String: Any]] ?? []
             let rewards  = staking["rewards"] as? [[String: Any]] ?? []
@@ -475,22 +510,12 @@ final class WalletDetailViewModel: ObservableObject {
             hasFetched = true  // UI renders NOW — positions + orders visible
             print("⏱ [\(elapsed())] ✅ hasFetched = true (UI can render)")
 
-            // ── Phase 2: secondary data (non-blocking for initial render) ──
-            print("⏱ [\(elapsed())] MIDPRICES AWAIT START")
-            await midPriceTask
-            print("⏱ [\(elapsed())] MIDPRICES AWAIT END")
-
-            print("⏱ [\(elapsed())] PARSE SPOT START")
-            parseSpot(spot)
-            print("⏱ [\(elapsed())] PARSE SPOT END  count=\(spotBalances.count)")
-
+            // ── Phase 2a: transactions (pure CPU, no network dependency) ──
+            // Parse fills + transactions immediately so the Transactions tab
+            // is ready by the time the user taps it. No need to wait for midprices.
             print("⏱ [\(elapsed())] PARSE FILLS START  raw=\(rawFills.count)")
             parseFills(rawFills)
             print("⏱ [\(elapsed())] PARSE FILLS END  count=\(fills.count)")
-
-            print("⏱ [\(elapsed())] COMPUTE OVERVIEW START")
-            computeOverview()
-            print("⏱ [\(elapsed())] COMPUTE OVERVIEW END")
 
             print("⏱ [\(elapsed())] PARSE TRANSACTIONS START  raw=\(ledger.count)")
             parseTransactions(ledger)
@@ -500,16 +525,26 @@ final class WalletDetailViewModel: ObservableObject {
             mergeFillsIntoTransactions()
             print("⏱ [\(elapsed())] MERGE FILLS INTO TX END  total=\(transactions.count)")
 
+            print("⏱ [\(elapsed())] COMPUTE OVERVIEW START")
+            computeOverview()
+            print("⏱ [\(elapsed())] COMPUTE OVERVIEW END")
+
+            // ── Phase 2b: spot (needs midprices network call) ──
+            print("⏱ [\(elapsed())] MIDPRICES AWAIT START")
+            await midPriceTask
+            print("⏱ [\(elapsed())] MIDPRICES AWAIT END")
+
+            print("⏱ [\(elapsed())] PARSE SPOT START")
+            parseSpot(spot)
+            print("⏱ [\(elapsed())] PARSE SPOT END  count=\(spotBalances.count)")
+
             print("⏱ [\(elapsed())] PARSE STAKING START")
             parseStaking(summary: stakeSum, delegations: delegs, rewards: rewards)
             print("⏱ [\(elapsed())] PARSE STAKING END")
 
-            // Background: paginate older fills
-            let capturedLedger = ledger
-            Task { [weak self] in
-                await self?.paginateOlderFills(address: address, ledger: capturedLedger)
-            }
-            print("⏱ [\(elapsed())] BACKEND PATH COMPLETE")
+            // Older fills are now loaded on demand via "Load More" button
+            // (no automatic background pagination)
+            print("⏱ [\(elapsed())] BACKEND PATH COMPLETE  txTotal=\(txTotalCount) displayed=\(txDisplayLimit)")
             return true
         } catch {
             print("⏱ [\(elapsed())] BACKEND ERROR: \(error)")
@@ -521,13 +556,16 @@ final class WalletDetailViewModel: ObservableObject {
     /// Phase 1: positions + orders (instant display)
     /// Phase 2: spot + fills, staking, HIP-3 (background)
     private func loadFromHLAPI(address: String) async {
-        // ── Phase 1: essential data (positions, orders, spot) ──
         do {
-            print("⏱ [\(elapsed())] HLAPI PHASE1 START (state + spot + midPrices)")
-            async let stateTask = api.fetchUserState(address: address)
-            async let spotTask  = api.fetchSpotState(address: address)
+            // ── All network requests in parallel ──
+            print("⏱ [\(elapsed())] HLAPI START (state + spot + midPrices + fills + ledger)")
+            async let stateTask  = api.fetchUserState(address: address)
+            async let spotTask   = api.fetchSpotState(address: address)
             async let midTask: () = fetchMidPrices()
+            async let fillsTask  = api.fetchUserFills(address: address)
+            async let ledgerTask = { try? await self.api.fetchLedgerUpdates(address: address) }()
 
+            // ── Phase 1: positions + orders (first render) ──
             let state = try await stateTask
             print("⏱ [\(elapsed())] HLAPI STATE RECEIVED")
 
@@ -538,40 +576,42 @@ final class WalletDetailViewModel: ObservableObject {
             hasFetched = true
             print("⏱ [\(elapsed())] ✅ hasFetched = true (UI can render)")
 
-            let spot = (try? await spotTask) ?? [:]
-            print("⏱ [\(elapsed())] HLAPI SPOT RECEIVED")
-            await midTask
-            print("⏱ [\(elapsed())] HLAPI MIDPRICES DONE")
-            parseSpot(spot)
-            computeOverview()
-            print("⏱ [\(elapsed())] HLAPI PHASE1 COMPLETE")
+            // ── Phase 2a: fills + transactions (may already be done, pure CPU after await) ──
+            let rawFills = (try? await fillsTask) ?? []
+            let ledger   = await ledgerTask ?? []
+            print("⏱ [\(elapsed())] HLAPI FILLS+LEDGER RECEIVED  fills=\(rawFills.count) ledger=\(ledger.count)")
 
-            // ── Phase 2: secondary data (awaited so isLoading stays true) ──
-            print("⏱ [\(elapsed())] HLAPI PHASE2 START (fills, staking, HIP3)")
+            parseFills(rawFills)
+            parseTransactions(ledger)
+            mergeFillsIntoTransactions()
+            txTotalFills  = rawFills.count
+            txLoadAddress = address
+            computeOverview()
+            print("⏱ [\(elapsed())] HLAPI TRANSACTIONS READY  total=\(transactions.count)")
+
+            // ── Phase 2b: spot (needs midprices) ──
+            let spot = (try? await spotTask) ?? [:]
+            await midTask
+            print("⏱ [\(elapsed())] HLAPI SPOT+MIDPRICES DONE")
+            parseSpot(spot)
+
+            // ── Phase 3: staking + HIP-3 (least critical) ──
+            print("⏱ [\(elapsed())] HLAPI PHASE3 START (staking, HIP3)")
             await loadSecondaryData(address: address)
-            print("⏱ [\(elapsed())] HLAPI PHASE2 COMPLETE")
+            print("⏱ [\(elapsed())] HLAPI PHASE3 COMPLETE")
         } catch {
             errorMsg = error.localizedDescription
         }
     }
 
-    /// Load fills, staking, HIP-3 in background after positions are displayed.
+    /// Load staking + HIP-3 data (fills/ledger are now fetched earlier in loadFromHLAPI).
     private func loadSecondaryData(address: String) async {
         // Fetch validator names if not cached yet
         if Self.validatorNames == nil {
             Task { await Self.loadValidatorNames() }
         }
 
-        // Batch 1: fills + ledger (2 calls)
-        async let fillsTask  = api.fetchUserFills(address: address)
-        async let ledgerTask = try? api.fetchLedgerUpdates(address: address)
-        let rawFills = (try? await fillsTask) ?? []
-        let ledger   = await ledgerTask ?? []
-
-        // Small delay to avoid rate limiting
-        try? await Task.sleep(nanoseconds: 300_000_000)
-
-        // Batch 2: staking data (3 calls)
+        // Staking data (3 calls)
         async let stakeSumTask = try? api.fetchDelegatorSummary(address: address)
         async let delegTask    = try? api.fetchDelegations(address: address)
         async let rewardsTask  = try? api.fetchDelegatorRewards(address: address)
@@ -582,17 +622,12 @@ final class WalletDetailViewModel: ObservableObject {
         // Small delay before HIP-3 (which itself makes multiple calls)
         try? await Task.sleep(nanoseconds: 300_000_000)
 
-        // Batch 3: HIP-3 positions (sequential inside)
+        // HIP-3 positions (sequential inside)
         let hip3 = await api.fetchHIP3States(address: address)
 
-        // HIP-3 perp positions
         for (_, dexState) in hip3 {
             parseHIP3Positions(from: dexState)
         }
-        parseFills(rawFills)
-        computeOverview()
-        parseTransactions(ledger)
-        mergeFillsIntoTransactions()
         parseStaking(summary: stakeSum, delegations: delegs, rewards: rewards)
 
         // Update cache with complete data
@@ -612,11 +647,7 @@ final class WalletDetailViewModel: ObservableObject {
             }
         }
 
-        // Background: paginate older fills
-        let capturedLedger = ledger
-        Task { [weak self] in
-            await self?.paginateOlderFills(address: address, ledger: capturedLedger)
-        }
+        // Older fills are now loaded on demand via "Load More" button
     }
 
     // MARK: - Background fill scanning
@@ -1016,6 +1047,7 @@ final class WalletDetailViewModel: ObservableObject {
                 return nil
             }
         }).sorted { $0.time > $1.time }
+        txParsedLedgerCount = transactions.count
     }
 
     private func mergeFillsIntoTransactions() {
@@ -1054,6 +1086,114 @@ final class WalletDetailViewModel: ObservableObject {
 
         transactions.append(contentsOf: fillTxs)
         transactions.sort { $0.time > $1.time }
+    }
+
+    // MARK: - Load More Transactions (explicit, LARP-style)
+
+    /// Called by "Load More" button — fetches the next page of fills from HL API
+    /// using a time cursor (oldest fill timestamp), then appends to transactions.
+    func loadMoreTransactions() async {
+        guard !txIsLoadingMore else { return }
+        let address = txLoadAddress
+        guard !address.isEmpty else { return }
+
+        // Step 1: If we already have more parsed transactions than displayed, just reveal them
+        if transactions.count > txDisplayLimit {
+            txDisplayLimit += 50
+            return
+        }
+
+        // Step 2: Fetch older fills from HL API using time-based cursor
+        guard fills.count < txTotalFills else {
+            // No more fills to fetch — just bump the display limit for any remaining ledger tx
+            txDisplayLimit += 50
+            return
+        }
+
+        txIsLoadingMore = true
+        defer { txIsLoadingMore = false }
+
+        let oldestFillMs = fills.map { Int64($0.time.timeIntervalSince1970 * 1000) }.min() ?? 0
+        guard oldestFillMs > 0 else { return }
+
+        // Fetch fills ending before our oldest
+        let endMs = oldestFillMs - 1
+        let startMs = endMs - 30 * 86400 * 1000  // 30 day window
+
+        guard let data = try? await api.post(body: [
+            "type": "userFillsByTime",
+            "user": address,
+            "startTime": Int(startMs),
+            "endTime": Int(endMs),
+            "aggregateByTime": false
+        ] as [String: Any]) else { return }
+
+        let rawPage = (try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
+
+        if rawPage.isEmpty {
+            // No more fills — mark total as loaded
+            txTotalFills = fills.count
+            txDisplayLimit += 50
+            return
+        }
+
+        // Parse new fills (dedup by time+coin+size)
+        let existingKeys = Set(fills.map { "\($0.time.timeIntervalSince1970)-\($0.coin)-\($0.size)" })
+        let newFills: [UserFill] = rawPage.compactMap { f in
+            guard let coin  = f["coin"] as? String,
+                  let pxStr = f["px"] as? String,   let px  = Double(pxStr),
+                  let szStr = f["sz"] as? String,   let sz  = Double(szStr),
+                  let side  = f["side"] as? String,
+                  let timeMs = f["time"] as? Int64 ?? (f["time"] as? NSNumber)?.int64Value
+            else { return nil }
+            let t = Date(timeIntervalSince1970: Double(timeMs) / 1000)
+            let key = "\(t.timeIntervalSince1970)-\(coin)-\(sz)"
+            guard !existingKeys.contains(key) else { return nil }
+            let dir = f["dir"] as? String ?? (side == "B" ? "Buy" : "Sell")
+            let closedPnl = Self.parseDouble(f["closedPnl"])
+            let fee       = Self.parseDouble(f["fee"])
+            return UserFill(coin: coin, price: px, size: sz, side: side,
+                            time: t, closedPnl: closedPnl, fee: fee, dir: dir)
+        }
+
+        if !newFills.isEmpty {
+            fills.append(contentsOf: newFills)
+            fills.sort { $0.time > $1.time }
+
+            // Convert new fills to transactions and append
+            let newTxs: [WalletTransaction] = newFills.map { fill in
+                let txType: WalletTransaction.TxType
+                switch fill.dir {
+                case "Open Long":    txType = .openLong
+                case "Close Long":   txType = .closeLong
+                case "Open Short":   txType = .openShort
+                case "Close Short":  txType = .closeShort
+                default:             txType = fill.isBuy ? .buy : .sell
+                }
+                let coin = resolvedCoinName(fill.coin)
+                let sizeStr = fill.size >= 1_000
+                    ? String(format: "%.2f", fill.size)
+                    : String(format: "%.4f", fill.size)
+                let usdVal = fill.size * fill.price
+                let amount = formatUSDValue(usdVal)
+                let amountUSD = "\(sizeStr) \(coin)"
+                var detail = "\(coin) @\(formatPrice(fill.price))"
+                if fill.closedPnl != 0 {
+                    let sign = fill.closedPnl >= 0 ? "+" : ""
+                    detail += " · PnL \(sign)$\(String(format: "%.2f", fill.closedPnl))"
+                }
+                return WalletTransaction(
+                    time: fill.time, type: txType,
+                    amount: amount, amountUSD: amountUSD,
+                    detail: detail, hash: ""
+                )
+            }
+            transactions.append(contentsOf: newTxs)
+            transactions.sort { $0.time > $1.time }
+            computeOverview()
+        }
+
+        txDisplayLimit += 50
     }
 
     private func formatUSDValue(_ v: Double) -> String {

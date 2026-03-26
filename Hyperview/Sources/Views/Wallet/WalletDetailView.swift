@@ -343,22 +343,34 @@ struct WalletDetailView: View {
 
     private var transactionsTab: some View {
         VStack(spacing: 0) {
-            // Filter bar
-            Button { showTxFilter.toggle() } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "line.3.horizontal.decrease.circle")
-                        .font(.system(size: 14))
-                    Text("Filter (\(vm.selectedTxTypes.count)/\(WalletTransaction.TxType.allCases.count))")
-                        .font(.system(size: 13, weight: .medium))
-                    Spacer()
+            // Filter bar + count
+            HStack(spacing: 0) {
+                Button { showTxFilter.toggle() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                            .font(.system(size: 14))
+                        Text("Filter (\(vm.selectedTxTypes.count)/\(WalletTransaction.TxType.allCases.count))")
+                            .font(.system(size: 13, weight: .medium))
+                        Spacer()
+                    }
+                    .foregroundColor(Color(white: 0.6))
+                }
+
+                if vm.txTotalCount > 0 {
+                    Text("\(vm.filteredTransactions.count) / \(vm.txTotalCount)")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(Color(white: 0.4))
+                }
+
+                Button { showTxFilter.toggle() } label: {
                     Image(systemName: showTxFilter ? "chevron.up" : "chevron.down")
                         .font(.system(size: 11))
+                        .foregroundColor(Color(white: 0.6))
                 }
-                .foregroundColor(Color(white: 0.6))
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(Color.hlCardBackground)
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(Color.hlCardBackground)
 
             if showTxFilter {
                 txFilterGrid
@@ -372,10 +384,41 @@ struct WalletDetailView: View {
             } else if vm.filteredTransactions.isEmpty {
                 emptyTab(icon: "list.bullet.rectangle", message: "No transactions")
             } else {
-                List(vm.filteredTransactions) { tx in
-                    transactionRow(tx)
-                        .listRowBackground(Color.hlCardBackground)
-                        .listRowSeparatorTint(Color.hlDivider)
+                List {
+                    ForEach(vm.filteredTransactions) { tx in
+                        transactionRow(tx)
+                            .listRowBackground(Color.hlCardBackground)
+                            .listRowSeparatorTint(Color.hlDivider)
+                    }
+
+                    // Load More button (LARP-style)
+                    if vm.txHasMore {
+                        if vm.txIsLoadingMore {
+                            HStack {
+                                Spacer()
+                                ProgressView().tint(.white)
+                                Text("Loading more…")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Color(white: 0.4))
+                                Spacer()
+                            }
+                            .listRowBackground(Color.hlCardBackground)
+                        } else {
+                            Button {
+                                Task { await vm.loadMoreTransactions() }
+                            } label: {
+                                HStack {
+                                    Spacer()
+                                    Text("Load More (\(min(vm.txDisplayLimit, vm.transactions.count)) of \(vm.txTotalCount))")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundColor(.hlGreen)
+                                    Spacer()
+                                }
+                                .padding(.vertical, 8)
+                            }
+                            .listRowBackground(Color.hlCardBackground)
+                        }
+                    }
                 }
                 .listStyle(.plain)
                 .refreshable { await vm.refresh(address: address) }
