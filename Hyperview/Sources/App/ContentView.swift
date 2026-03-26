@@ -228,6 +228,9 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background {
+                // Flush current market order to App Group so the widget
+                // reflects the latest in-app arrangement immediately.
+                marketsVM.forceWidgetReload()
                 wallet.lockApp()
             } else if phase == .active && !wallet.isUnlocked && (wallet.biometricEnabled || wallet.hasPassword) {
                 Task { await wallet.authenticateAppLaunch() }
