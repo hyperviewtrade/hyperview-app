@@ -38,6 +38,18 @@ final class UnstakingViewModel: ObservableObject {
     /// The in-flight prefetch task, so callers can await it instead of bailing.
     private var activeLoadTask: Task<Void, Never>?
 
+    // MARK: - Disk cache
+
+    private static let cacheKey = "unstaking_queue_cache"
+    private static let cacheTimeKey = "unstaking_queue_time"
+    private static let cacheTTL: TimeInterval = 120 // 2 min
+
+    // MARK: - Init (load cache immediately)
+
+    private init() {
+        loadFromCache()
+    }
+
     // MARK: - Prefetch (call from splash)
 
     /// Starts loading in background. Returns immediately.
@@ -49,10 +61,11 @@ final class UnstakingViewModel: ObservableObject {
     /// Awaits the in-flight prefetch, or loads if nothing was started yet.
     func ensureLoaded() async {
         if let task = activeLoadTask {
-            await task.value              // wait for prefetch to finish
+            await task.value
         }
+        // Only retry if cache is empty AND no data loaded
         if queueEntries.isEmpty {
-            await _doLoad()               // prefetch failed or never ran — retry
+            await _doLoad()
         }
     }
 
@@ -66,15 +79,21 @@ final class UnstakingViewModel: ObservableObject {
         guard !isLoading else { return }
         isLoading = true
         errorMsg = nil
+        // Do NOT clear queueEntries — keep cached data visible during refresh
 
         do {
             let entries = try await fetchUnstakingQueue()
-            queueEntries = entries
-            computeStats()
-            aggregateDailyBars()
-            applySortAndFilter()
+            // Only update if we got data (never downgrade to empty)
+            if !entries.isEmpty {
+                queueEntries = entries
+                computeStats()
+                aggregateDailyBars()
+                applySortAndFilter()
+                saveToCache(entries)
+            }
         } catch {
             errorMsg = error.localizedDescription
+            // Keep existing cached data on failure — don't clear
         }
 
         isLoading = false
@@ -84,6 +103,37 @@ final class UnstakingViewModel: ObservableObject {
         isLoading = false
         activeLoadTask = nil
         await _doLoad()
+    }
+
+    // MARK: - Cache persistence
+
+    private func loadFromCache() {
+        guard let arr = UserDefaults.standard.array(forKey: Self.cacheKey) as? [[String: Any]] else { return }
+        let entries: [UnstakingQueueEntry] = arr.compactMap { dict in
+            guard let ts = dict["t"] as? Double,
+                  let user = dict["u"] as? String,
+                  let amount = dict["a"] as? Double else { return nil }
+            return UnstakingQueueEntry(time: Date(timeIntervalSince1970: ts), userAddress: user, amountHYPE: amount)
+        }
+        if !entries.isEmpty {
+            queueEntries = entries
+            computeStats()
+            aggregateDailyBars()
+            applySortAndFilter()
+        }
+    }
+
+    private func saveToCache(_ entries: [UnstakingQueueEntry]) {
+        // Only cache upcoming entries (next 7 days + recent 1 day) to keep size small
+        let now = Date()
+        let cutoffPast = now.addingTimeInterval(-86400)
+        let cutoffFuture = now.addingTimeInterval(7 * 86400)
+        let toCache = entries.filter { $0.time >= cutoffPast && $0.time <= cutoffFuture }
+        let arr: [[String: Any]] = toCache.map { e in
+            ["t": e.time.timeIntervalSince1970, "u": e.userAddress, "a": e.amountHYPE]
+        }
+        UserDefaults.standard.set(arr, forKey: Self.cacheKey)
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cacheTimeKey)
     }
 
     // MARK: - Sort & Filter

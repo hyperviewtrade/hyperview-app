@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct UnstakingView: View {
-    @StateObject private var vm = UnstakingViewModel()
+    @ObservedObject private var vm = UnstakingViewModel.shared
     @State private var tab: UnstakingTab = .queue
     @Namespace private var tabIndicator
 
