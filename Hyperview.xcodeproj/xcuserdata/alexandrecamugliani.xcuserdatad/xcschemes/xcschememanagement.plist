@@ -7,7 +7,25 @@
 		<key>Hyperview.xcscheme_^#shared#^_</key>
 		<dict>
 			<key>orderHint</key>
+			<integer>1</integer>
+		</dict>
+		<key>HyperviewWidgets.xcscheme_^#shared#^_</key>
+		<dict>
+			<key>orderHint</key>
 			<integer>0</integer>
+		</dict>
+	</dict>
+	<key>SuppressBuildableAutocreation</key>
+	<dict>
+		<key>A4E275B42F602CE200148044</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+		<key>B1A000000000000000000002</key>
+		<dict>
+			<key>primary</key>
+			<true/>
 		</dict>
 	</dict>
 </dict>

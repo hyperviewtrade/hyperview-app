@@ -6,20 +6,86 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A4EFCD562F6301280059DD5F /* libsecp256k1 in Frameworks */ = {isa = PBXBuildFile; productRef = A4EFCD552F6301280059DD5F /* libsecp256k1 */; };
+		B1A00000000000000000000B /* HyperviewWidgets.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B1A000000000000000000001 /* HyperviewWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		B1A00000000000000000000C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A4E275AD2F602CE200148044 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B1A000000000000000000002;
+			remoteInfo = HyperviewWidgets;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		B1A00000000000000000000A /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				B1A00000000000000000000B /* HyperviewWidgets.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		A4E275B52F602CE200148044 /* Hyperview.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Hyperview.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1A000000000000000000001 /* HyperviewWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = HyperviewWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		B1A00000000000000000000E /* Exceptions for "HyperviewWidgets" folder in "HyperviewWidgets" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = B1A000000000000000000002 /* HyperviewWidgets */;
+		};
+		B1A00000000000000000000F /* Exceptions for "Hyperview" folder in "Hyperview" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = A4E275B42F602CE200148044 /* Hyperview */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		A4E275B72F602CE200148044 /* Hyperview */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				B1A00000000000000000000F /* Exceptions for "Hyperview" folder in "Hyperview" target */,
+			);
 			path = Hyperview;
+			sourceTree = "<group>";
+		};
+		B1A000000000000000000003 /* HyperviewWidgets */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				B1A00000000000000000000E /* Exceptions for "HyperviewWidgets" folder in "HyperviewWidgets" target */,
+			);
+			path = HyperviewWidgets;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		A4E275B22F602CE200148044 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A4EFCD562F6301280059DD5F /* libsecp256k1 in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B1A000000000000000000005 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -33,6 +99,7 @@
 			isa = PBXGroup;
 			children = (
 				A4E275B72F602CE200148044 /* Hyperview */,
+				B1A000000000000000000003 /* HyperviewWidgets */,
 				A4E275B62F602CE200148044 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +108,7 @@
 			isa = PBXGroup;
 			children = (
 				A4E275B52F602CE200148044 /* Hyperview.app */,
+				B1A000000000000000000001 /* HyperviewWidgets.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -55,20 +123,44 @@
 				A4E275B12F602CE200148044 /* Sources */,
 				A4E275B22F602CE200148044 /* Frameworks */,
 				A4E275B32F602CE200148044 /* Resources */,
+				TVCOPY00000000000000001 /* Copy TradingView Bundle */,
+				B1A00000000000000000000A /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				B1A00000000000000000000D /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				A4E275B72F602CE200148044 /* Hyperview */,
 			);
 			name = Hyperview;
 			packageProductDependencies = (
+				A4EFCD552F6301280059DD5F /* libsecp256k1 */,
 			);
 			productName = Hyperview;
 			productReference = A4E275B52F602CE200148044 /* Hyperview.app */;
 			productType = "com.apple.product-type.application";
+		};
+		B1A000000000000000000002 /* HyperviewWidgets */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B1A000000000000000000009 /* Build configuration list for PBXNativeTarget "HyperviewWidgets" */;
+			buildPhases = (
+				B1A000000000000000000004 /* Sources */,
+				B1A000000000000000000005 /* Frameworks */,
+				B1A000000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				B1A000000000000000000003 /* HyperviewWidgets */,
+			);
+			name = HyperviewWidgets;
+			productName = HyperviewWidgets;
+			productReference = B1A000000000000000000001 /* HyperviewWidgets.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -83,6 +175,9 @@
 					A4E275B42F602CE200148044 = {
 						CreatedOnToolsVersion = 26.3;
 					};
+					B1A000000000000000000002 = {
+						CreatedOnToolsVersion = 26.3;
+					};
 				};
 			};
 			buildConfigurationList = A4E275B02F602CE200148044 /* Build configuration list for PBXProject "Hyperview" */;
@@ -94,12 +189,16 @@
 			);
 			mainGroup = A4E275AC2F602CE200148044;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A4EFCD542F6301280059DD5F /* XCRemoteSwiftPackageReference "secp256k1.swift" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A4E275B62F602CE200148044 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				A4E275B42F602CE200148044 /* Hyperview */,
+				B1A000000000000000000002 /* HyperviewWidgets */,
 			);
 		};
 /* End PBXProject section */
@@ -112,7 +211,33 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B1A000000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		TVCOPY00000000000000001 /* Copy TradingView Bundle */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/TradingViewBundle",
+			);
+			name = "Copy TradingView Bundle";
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/TradingView",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# Copy TradingView charting library preserving directory structure\nDEST=\"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/TradingView\"\nrm -rf \"$DEST\"\ncp -R \"${SRCROOT}/TradingViewBundle\" \"$DEST\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		A4E275B12F602CE200148044 /* Sources */ = {
@@ -122,7 +247,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B1A000000000000000000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B1A00000000000000000000D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B1A000000000000000000002 /* HyperviewWidgets */;
+			targetProxy = B1A00000000000000000000C /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		A4E275BE2F602CE500148044 /* Debug */ = {
@@ -251,11 +391,15 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Hyperview/Hyperview.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 837JLWC59M;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Hyperview/Info.plist;
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Hyperview uses Face ID to secure your transactions and protect your private key.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -283,11 +427,15 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Hyperview/Hyperview.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 837JLWC59M;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Hyperview/Info.plist;
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Hyperview uses Face ID to secure your transactions and protect your private key.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -305,6 +453,56 @@
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		B1A000000000000000000007 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = HyperviewWidgets/HyperviewWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 837JLWC59M;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = HyperviewWidgets/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.Hyperview.Hyperview.HyperviewWidgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		B1A000000000000000000008 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = HyperviewWidgets/HyperviewWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 837JLWC59M;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = HyperviewWidgets/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.Hyperview.Hyperview.HyperviewWidgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -331,7 +529,35 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		B1A000000000000000000009 /* Build configuration list for PBXNativeTarget "HyperviewWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B1A000000000000000000007 /* Debug */,
+				B1A000000000000000000008 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		A4EFCD542F6301280059DD5F /* XCRemoteSwiftPackageReference "secp256k1.swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/GigaBitcoin/secp256k1.swift.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.22.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A4EFCD552F6301280059DD5F /* libsecp256k1 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A4EFCD542F6301280059DD5F /* XCRemoteSwiftPackageReference "secp256k1.swift" */;
+			productName = libsecp256k1;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A4E275AD2F602CE200148044 /* Project object */;
 }

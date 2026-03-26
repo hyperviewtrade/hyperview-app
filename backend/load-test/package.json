@@ -1,0 +1,13 @@
+{
+  "name": "hyperview-load-test",
+  "version": "1.0.0",
+  "scripts": {
+    "test:100": "node test.js --users=100 --duration=60",
+    "test:1k": "node test.js --users=1000 --duration=120",
+    "test:5k": "node test.js --users=5000 --duration=120",
+    "test:10k": "node test.js --users=10000 --duration=180"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

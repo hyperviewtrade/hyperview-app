@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.Hyperview.liqCheck</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.Hyperview.Hyperview</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>hyperview</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Hyperview needs access to save PNL and LARP cards to your photo library.</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>twitter</string>
+		<string>x</string>
+		<string>metamask</string>
+		<string>trust</string>
+		<string>cbwallet</string>
+		<string>rainbow</string>
+		<string>zerion</string>
+		<string>uniswap</string>
+		<string>rabby</string>
+		<string>phantom</string>
+		<string>okex</string>
+		<string>ledgerlive</string>
+		<string>safepal</string>
+		<string>bitkeep</string>
+		<string>oneinch</string>
+		<string>imtokenlon</string>
+		<string>exodus</string>
+		<string>argent</string>
+	</array>
+</dict>
+</plist>

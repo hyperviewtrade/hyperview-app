@@ -1,0 +1,17 @@
+{
+  "name": "hyperview-ws-relay",
+  "version": "2.0.0",
+  "description": "Hyperview WebSocket relay — filtered fan-out from Redis pub/sub to iOS clients",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "ws": "^8.18.0"
+  }
+}

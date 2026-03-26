@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #0A0A0A; }
+        #tv_chart_container { width: 100%; height: 100%; }
+
+        /* Custom toolbar toggle button — draggable vertically */
+        #customToolbarBtn {
+            position: fixed;
+            left: 0;
+            top: 80px;
+            z-index: 9999;
+            width: 28px;
+            height: 44px;
+            background: rgba(30, 30, 30, 0.85);
+            border: none;
+            border-radius: 0 8px 8px 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: none;
+            backdrop-filter: blur(4px);
+            -webkit-backdrop-filter: blur(4px);
+            transition: background 0.15s, opacity 0.2s;
+            opacity: 0.55;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        #customToolbarBtn:active {
+            background: rgba(50, 50, 50, 0.95);
+        }
+        #customToolbarBtn.open {
+            opacity: 1;
+        }
+        #customToolbarBtn.dragging {
+            opacity: 1;
+            transition: none;
+        }
+        #customToolbarBtn svg {
+            width: 14px;
+            height: 14px;
+            fill: #999;
+            transition: transform 0.2s;
+            pointer-events: none;
+        }
+        #customToolbarBtn.open svg {
+            transform: rotate(180deg);
+            fill: #1DB954;
+        }
+
+        /* Hide the native TradingView expand/collapse arrow for the left toolbar.
+           We use display:none since we handle toggling via direct DOM manipulation. */
+        .layout__area--left > div[class*="collapsed"] > div,
+        .layout__area--left [class*="arrow"],
+        .layout__area--left [class*="toggle"],
+        [data-name="drawing-toolbar"] [class*="arrow"],
+        [data-name="drawing-toolbar"] [class*="toggle"],
+        .drawing-toolbar [class*="toggle"],
+        .drawing-toolbar [class*="arrow"] {
+            display: none !important;
+        }
+    </style>
+    <script type="text/javascript" src="charting_library.standalone.js"></script>
+</head>
+<body>
+    <div id="tv_chart_container"></div>
+
+    <!-- Custom toolbar toggle button — positioned high, large tap target -->
+    <button id="customToolbarBtn" aria-label="Toggle drawing toolbar">
+        <svg viewBox="0 0 24 24"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
+    </button>
+
+    <script>
+    // ═══════════════════════════════════════════════════════════════
+    //  Hyperliquid Custom Datafeed for TradingView Advanced Charts
+    // ═══════════════════════════════════════════════════════════════
+
+    // Pending requests map: requestId → { resolve, reject }
+    const pendingRequests = {};
+    let requestCounter = 0;
+
+    // Real-time subscriber
+    let realtimeCallback = null;
+    let realtimeSubscriberUID = null;
+
+    // Send a request to Swift and return a Promise
+    function sendToSwift(type, payload) {
+        return new Promise((resolve, reject) => {
+            const id = ++requestCounter;
+            pendingRequests[id] = { resolve, reject };
+            window.webkit.messageHandlers.tradingview.postMessage(
+                JSON.stringify({ id, type, ...payload })
+            );
+            // Timeout after 15s
+            setTimeout(() => {
+                if (pendingRequests[id]) {
+                    delete pendingRequests[id];
+                    reject(new Error('Request timeout'));
+                }
+            }, 15000);
+        });
+    }
+
+    // Called from Swift to resolve pending requests
+    function resolveRequest(id, data) {
+        const req = pendingRequests[id];
+        if (req) {
+            delete pendingRequests[id];
+            req.resolve(data);
+        }
+    }
+
+    function rejectRequest(id, error) {
+        const req = pendingRequests[id];
+        if (req) {
+            delete pendingRequests[id];
+            req.reject(new Error(error));
+        }
+    }
+
+    // Called from Swift to push real-time bar updates
+    function onRealtimeBar(bar) {
+        if (realtimeCallback) {
+            realtimeCallback(bar);
+        }
+    }
+
+    // ─── TradingView resolution mapping ────────────────────────
+    const supportedResolutions = [
+        '1', '2', '3', '5', '15', '30',
+        '60', '120', '240', '480', '720',
+        '1D', '3D', '1W', '1M'
+    ];
+
+    // Map TradingView resolution to Hyperliquid interval string
+    function resolutionToHL(resolution) {
+        const map = {
+            '1': '1m', '2': '2m', '3': '3m', '5': '5m',
+            '15': '15m', '30': '30m', '60': '1h', '120': '2h',
+            '240': '4h', '480': '8h', '720': '12h',
+            '1D': '1d', '3D': '3d', '1W': '1w', '1M': '1M'
+        };
+        return map[resolution] || '1h';
+    }
+
+    // ─── Global flag: true when displaying a custom TradingView symbol ──
+    let isCustomSymbol = false;
+
+    // ─── Unified Datafeed (routes to HL or external via Swift bridge) ──
+    const UnifiedDatafeed = {
+
+        onReady: function(callback) {
+            setTimeout(() => {
+                callback({
+                    supported_resolutions: supportedResolutions,
+                    supports_marks: false,
+                    supports_timescale_marks: false,
+                    supports_time: true,
+                    exchanges: [],
+                });
+            }, 0);
+        },
+
+        searchSymbols: function(userInput, exchange, symbolType, onResult) {
+            onResult([]);
+        },
+
+        resolveSymbol: function(symbolName, onResolve, onError) {
+            sendToSwift('resolveSymbol', { symbol: symbolName, isCustom: isCustomSymbol })
+                .then(info => {
+                    const exchange = isCustomSymbol
+                        ? (info.exchange || symbolName.split(':')[0] || 'External')
+                        : 'Hyperliquid';
+                    onResolve({
+                        name: info.name || symbolName,
+                        description: info.description || symbolName,
+                        type: info.type || 'crypto',
+                        session: '24x7',
+                        timezone: 'Etc/UTC',
+                        exchange: exchange,
+                        listed_exchange: exchange,
+                        minmov: 1,
+                        pricescale: info.pricescale || 100,
+                        has_intraday: true,
+                        has_daily: true,
+                        has_weekly_and_monthly: true,
+                        supported_resolutions: supportedResolutions,
+                        volume_precision: 2,
+                        data_status: isCustomSymbol ? 'pulsed' : 'streaming',
+                    });
+                })
+                .catch(err => onError(err.message));
+        },
+
+        getBars: function(symbolInfo, resolution, periodParams, onResult, onError) {
+            const hlInterval = resolutionToHL(resolution);
+            sendToSwift('getBars', {
+                symbol: symbolInfo.name,
+                interval: hlInterval,
+                from: periodParams.from,
+                to: periodParams.to,
+                countBack: periodParams.countBack,
+                firstDataRequest: periodParams.firstDataRequest,
+                isCustom: isCustomSymbol
+            })
+            .then(data => {
+                const bars = (data.bars || []).map(b => ({
+                    time: b.time,
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume
+                }));
+                onResult(bars, { noData: data.noData || false });
+            })
+            .catch(err => onError(err.message));
+        },
+
+        subscribeBars: function(symbolInfo, resolution, onRealtimeCallback, subscriberUID, onResetCacheNeededCallback) {
+            realtimeCallback = onRealtimeCallback;
+            realtimeSubscriberUID = subscriberUID;
+            const hlInterval = resolutionToHL(resolution);
+            sendToSwift('subscribeBars', {
+                symbol: symbolInfo.name,
+                interval: hlInterval,
+                subscriberUID: subscriberUID,
+                isCustom: isCustomSymbol
+            }).catch(() => {});
+        },
+
+        unsubscribeBars: function(subscriberUID) {
+            if (realtimeSubscriberUID === subscriberUID) {
+                realtimeCallback = null;
+                realtimeSubscriberUID = null;
+            }
+            sendToSwift('unsubscribeBars', { subscriberUID })
+                .catch(() => {});
+        }
+    };
+
+    // ─── Widget initialization ─────────────────────────────────
+    let tvWidget = null;
+
+    function initChart(symbol, interval, theme, custom) {
+        if (tvWidget) {
+            tvWidget.remove();
+            tvWidget = null;
+        }
+
+        // Detect custom TradingView symbol (TV: prefix or explicit flag)
+        isCustomSymbol = !!custom || (symbol && symbol.startsWith('TV:'));
+        let actualSymbol = symbol;
+        if (actualSymbol && actualSymbol.startsWith('TV:')) {
+            actualSymbol = actualSymbol.substring(3);
+        }
+
+        const tvInterval = interval || '60';
+
+        tvWidget = new TradingView.widget({
+            container: 'tv_chart_container',
+            datafeed: UnifiedDatafeed,
+            library_path: './',
+            locale: 'en',
+            fullscreen: true,
+            symbol: actualSymbol || 'BTC',
+            interval: tvInterval,
+            theme: 'dark',
+            autosize: true,
+            timezone: 'Etc/UTC',
+
+            // ── Styling ──────────────────────────────
+            custom_css_url: '',
+            loading_screen: { backgroundColor: '#0A0A0A', foregroundColor: '#1DB954' },
+
+            overrides: {
+                'paneProperties.background': '#0A0A0A',
+                'paneProperties.backgroundType': 'solid',
+                'paneProperties.vertGridProperties.color': '#1a1a1a',
+                'paneProperties.horzGridProperties.color': '#1a1a1a',
+                'scalesProperties.backgroundColor': '#0A0A0A',
+                'scalesProperties.textColor': '#666666',
+                'scalesProperties.lineColor': '#1a1a1a',
+                'mainSeriesProperties.candleStyle.upColor': '#1DB954',
+                'mainSeriesProperties.candleStyle.downColor': '#E54D42',
+                'mainSeriesProperties.candleStyle.wickUpColor': '#1DB954',
+                'mainSeriesProperties.candleStyle.wickDownColor': '#E54D42',
+                'mainSeriesProperties.candleStyle.borderUpColor': '#1DB954',
+                'mainSeriesProperties.candleStyle.borderDownColor': '#E54D42',
+                'mainSeriesProperties.hollowCandleStyle.upColor': '#1DB954',
+                'mainSeriesProperties.hollowCandleStyle.downColor': '#E54D42',
+                'mainSeriesProperties.haStyle.upColor': '#1DB954',
+                'mainSeriesProperties.haStyle.downColor': '#E54D42',
+                'mainSeriesProperties.haStyle.wickUpColor': '#1DB954',
+                'mainSeriesProperties.haStyle.wickDownColor': '#E54D42',
+                'mainSeriesProperties.haStyle.borderUpColor': '#1DB954',
+                'mainSeriesProperties.haStyle.borderDownColor': '#E54D42',
+                'mainSeriesProperties.barStyle.upColor': '#1DB954',
+                'mainSeriesProperties.barStyle.downColor': '#E54D42',
+                'mainSeriesProperties.lineStyle.color': '#1DB954',
+                'mainSeriesProperties.areaStyle.linecolor': '#1DB954',
+                'mainSeriesProperties.areaStyle.color1': 'rgba(29,185,84,0.28)',
+                'mainSeriesProperties.areaStyle.color2': 'rgba(29,185,84,0.02)',
+                'mainSeriesProperties.baselineStyle.topLineColor': '#1DB954',
+                'mainSeriesProperties.baselineStyle.bottomLineColor': '#E54D42',
+                'volumePaneSize': 'tiny',
+            },
+
+            studies_overrides: {
+                'volume.volume.color.0': '#E54D42',
+                'volume.volume.color.1': '#1DB954',
+                'volume.volume.transparency': 60,
+            },
+
+            disabled_features: [
+                'use_localstorage_for_settings',
+                'header_symbol_search',
+                'header_compare',
+                'header_screenshot',
+                'header_fullscreen_button',
+                'header_saveload',
+                'go_to_date',
+                'volume_force_overlay',
+                'symbol_search_hot_key',
+                'border_around_the_chart',
+            ],
+
+            enabled_features: [
+                'move_logo_to_main_pane',
+                'hide_left_toolbar_by_default',
+            ],
+
+            time_frames: [],
+        });
+
+        tvWidget.onChartReady(function() {
+            // Ensure volume study is always present (fixes intermittent missing volume)
+            try {
+                var studies = tvWidget.activeChart().getAllStudies();
+                var hasVolume = studies.some(function(s) { return s.name === 'Volume'; });
+                if (!hasVolume) {
+                    tvWidget.activeChart().createStudy('Volume', false, false, {}, null, {
+                        'volume.volume.color.0': '#E54D42',
+                        'volume.volume.color.1': '#1DB954',
+                        'volume.volume.transparency': 60,
+                    });
+                }
+            } catch(e) {}
+
+            // Detect the initial state of the drawing toolbar from the DOM
+            var leftArea = document.querySelector('.layout__area--left');
+            if (leftArea) {
+                var cs = window.getComputedStyle(leftArea);
+                var isHidden = (cs.display === 'none') || (leftArea.offsetWidth === 0) || (cs.width === '0px');
+                drawingToolbarOpen = !isHidden;
+            } else {
+                drawingToolbarOpen = false;
+            }
+            var btn = document.getElementById('customToolbarBtn');
+            if (btn) btn.classList.toggle('open', drawingToolbarOpen);
+
+            // Notify Swift the chart is ready
+            window.webkit.messageHandlers.tradingview.postMessage(
+                JSON.stringify({ type: 'chartReady' })
+            );
+        });
+    }
+
+    // Called from Swift to change symbol
+    function changeSymbol(symbol, interval, custom) {
+        // Update custom flag
+        isCustomSymbol = !!custom || (symbol && symbol.startsWith('TV:'));
+        let actualSymbol = symbol;
+        if (actualSymbol && actualSymbol.startsWith('TV:')) {
+            actualSymbol = actualSymbol.substring(3);
+        }
+
+        if (tvWidget) {
+            tvWidget.activeChart().setSymbol(actualSymbol, function() {});
+            if (interval) {
+                tvWidget.activeChart().setResolution(interval, function() {});
+            }
+        }
+    }
+
+    // Called from Swift to force the chart to re-fetch data
+    function refreshData() {
+        if (tvWidget) {
+            tvWidget.activeChart().resetData();
+        }
+    }
+
+    // Called from Swift to change resolution/interval
+    function changeResolution(resolution) {
+        if (tvWidget) {
+            tvWidget.activeChart().setResolution(resolution, function() {});
+        }
+    }
+
+    // Called from Swift to change chart type
+    // TradingView types: 1=Bars, 2=Candles, 3=Line, 4=Area, 8=HeikinAshi, 9=HollowCandle
+    function setChartType(type) {
+        if (tvWidget) {
+            tvWidget.activeChart().setChartType(type);
+        }
+    }
+
+    // ─── Custom drawing toolbar toggle (draggable) ─────────
+    let drawingToolbarOpen = false;
+
+    function toggleDrawingToolbar() {
+        if (!tvWidget) return;
+
+        // Direct DOM manipulation — bypass executeActionById which double-toggles
+        var leftArea = document.querySelector('.layout__area--left');
+        if (!leftArea) return;
+
+        // Detect current state: toolbar is hidden if display is 'none' or width is '0px'
+        var computedStyle = window.getComputedStyle(leftArea);
+        var isCurrentlyHidden = (computedStyle.display === 'none') ||
+                                (leftArea.offsetWidth === 0) ||
+                                (computedStyle.width === '0px');
+
+        if (isCurrentlyHidden) {
+            // Expand: show the toolbar
+            leftArea.style.display = 'flex';
+            leftArea.style.width = '';
+            leftArea.style.minWidth = '';
+            leftArea.style.overflow = '';
+            drawingToolbarOpen = true;
+        } else {
+            // Collapse: hide the toolbar
+            leftArea.style.display = 'none';
+            drawingToolbarOpen = false;
+        }
+
+        var btn = document.getElementById('customToolbarBtn');
+        if (btn) btn.classList.toggle('open', drawingToolbarOpen);
+    }
+
+    // ─── Make the toolbar button draggable vertically ────
+    (function() {
+        const btn = document.getElementById('customToolbarBtn');
+        if (!btn) return;
+
+        let isDragging = false;
+        let startY = 0;
+        let startTop = 0;
+        let dragDistance = 0;
+        let touchHandled = false; // true when touchend already fired the toggle
+        const DRAG_THRESHOLD = 8; // px — below this it's a tap, above it's a drag
+
+        // Restore saved position
+        const savedTop = localStorage.getItem('toolbarBtnTop');
+        if (savedTop) btn.style.top = savedTop + 'px';
+
+        btn.addEventListener('touchstart', function(e) {
+            const touch = e.touches[0];
+            startY = touch.clientY;
+            startTop = parseInt(btn.style.top) || 80;
+            dragDistance = 0;
+            isDragging = false;
+        }, { passive: true });
+
+        btn.addEventListener('touchmove', function(e) {
+            e.preventDefault();
+            const touch = e.touches[0];
+            const dy = touch.clientY - startY;
+            dragDistance = Math.abs(dy);
+
+            if (dragDistance > DRAG_THRESHOLD) {
+                isDragging = true;
+                btn.classList.add('dragging');
+                const newTop = Math.max(20, Math.min(window.innerHeight - 60, startTop + dy));
+                btn.style.top = newTop + 'px';
+            }
+        }, { passive: false });
+
+        btn.addEventListener('touchend', function(e) {
+            btn.classList.remove('dragging');
+            if (isDragging) {
+                // Save position
+                const finalTop = parseInt(btn.style.top) || 80;
+                localStorage.setItem('toolbarBtnTop', finalTop);
+                isDragging = false;
+            } else {
+                // It was a tap — toggle toolbar
+                touchHandled = true;
+                toggleDrawingToolbar();
+            }
+        }, { passive: true });
+
+        // Click handler: only toggle if touchend did not already handle it.
+        // This ensures non-touch devices (desktop) still work, while touch
+        // devices don't double-fire (touchend + click).
+        btn.addEventListener('click', function(e) {
+            if (touchHandled) {
+                touchHandled = false;
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+            toggleDrawingToolbar();
+        });
+    })();
+    </script>
+</body>
+</html>
