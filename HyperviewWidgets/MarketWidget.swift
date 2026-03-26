@@ -568,6 +568,9 @@ private enum SharedMarketReader {
         let watchSet = Set(defaults.stringArray(forKey: "widget_watchlist") ?? [])
         let customCharts = loadCustomCharts()
 
+        // --- Temporary debug log ---
+        print("WIDGET APP GROUP READ TOP10: \(arr.prefix(10).compactMap { ($0["s"] as? String) })")
+
         let hlMarkets = arr.compactMap { dict -> WidgetMarket? in
             guard let name = dict["n"] as? String,
                   let price = dict["p"] as? Double,
@@ -618,6 +621,9 @@ private enum SharedMarketReader {
                 .map { $0 + 1 } ?? 0
             markets = Array(hlMarkets.prefix(insertIdx)) + customCharts + Array(hlMarkets.dropFirst(insertIdx))
         }
+
+        // --- Temporary debug log ---
+        print("WIDGET FINAL DISPLAY TOP10: \(markets.prefix(10).map(\.symbol))")
 
         // Build icon map from WidgetCache — reuse already-fetched icons, only download new ones.
         let cachedIcons: [String: Data] = Dictionary(

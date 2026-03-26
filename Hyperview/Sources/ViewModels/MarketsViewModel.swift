@@ -404,9 +404,15 @@ final class MarketsViewModel: ObservableObject {
         if let order = unifiedOrder {
             defaults?.set(order, forKey: "widget_unified_order")
         }
-        // Re-share current top markets to App Group so the widget has fresh data
+        // Use the same filtered/sorted/favorites-first list that the UI displays,
+        // NOT the raw `markets` array (which is unsorted API order).
+        let displayedMarkets = cachedFilteredMarkets.isEmpty ? markets : cachedFilteredMarkets
+
+        // --- Temporary debug log ---
+        print("APP FINAL ORDER TOP10: \(displayedMarkets.prefix(10).map(\.symbol))")
+
         if let defaults {
-            let top = markets.prefix(10).map { m -> [String: Any] in
+            let top = displayedMarkets.prefix(10).map { m -> [String: Any] in
                 let lp = livePrices[m.symbol] ?? m.price
                 let chg: Double = {
                     if let open = m.dailyOpenPrice, open > 0 {
@@ -420,6 +426,10 @@ final class MarketsViewModel: ObservableObject {
                     "icon": m.hlCoinIconName
                 ]
             }
+
+            // --- Temporary debug log ---
+            print("APP GROUP WRITE TOP10: \(top.map { ($0["s"] as? String ?? "?") })")
+
             defaults.set(top, forKey: "widget_shared_markets")
         }
         lastWidgetReload = .now
