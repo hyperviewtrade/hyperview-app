@@ -763,13 +763,13 @@ private enum SharedMarketReader {
     }
 
     /// Lightweight fallback: fetch only allMids (much smaller payload than metaAndAssetCtxs)
-    static func fetchAllMidsFallback(markets: [WidgetMarket]) async -> [String: (price: Double, change: Double, volume: Double)] {
-        let dailyOpens = loadDailyOpens()
+    static func fetchAllMidsFallback(markets: [WidgetMarket], fresh: Bool = false) async -> [String: (price: Double, change: Double, volume: Double)] {
+        let dailyOpens = fresh ? await fetchDailyOpensFromBackend(fresh: true) : loadDailyOpens()
         let hasHIP3 = markets.contains { $0.symbol.contains(":") }
 
         // Launch ALL fetches in parallel
         async let midsTask = fetchAllMids()
-        async let hip3Task: [String: Double] = hasHIP3 ? fetchHIP3Prices() : [:]
+        async let hip3Task: [String: Double] = hasHIP3 ? fetchHIP3Prices(fresh: fresh) : [:]
 
         let mids = await midsTask
         let hip3Prices = await hip3Task
@@ -819,10 +819,13 @@ private enum SharedMarketReader {
 
     /// Fetch HIP-3 prices from our backend /all-prices
     /// If that fails, fetch each HIP-3 DEX from HL in parallel (not sequentially).
-    private static func fetchHIP3Prices() async -> [String: Double] {
+    /// - Parameter fresh: When true, appends ?fresh=1 to bypass backend cache.
+    private static func fetchHIP3Prices(fresh: Bool = false) async -> [String: Double] {
         // Try 1: Our backend (has all HIP-3 cached)
-        if let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/all-prices") {
+        let suffix = fresh ? "?fresh=1" : ""
+        if let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/all-prices\(suffix)") {
             var request = URLRequest(url: url, timeoutInterval: 12)
+            if fresh { request.cachePolicy = .reloadIgnoringLocalCacheData }
             if let (data, resp) = try? await URLSession.shared.data(for: request),
                let http = resp as? HTTPURLResponse, http.statusCode == 200,
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -875,9 +878,12 @@ private enum SharedMarketReader {
     }
 
     /// Fetch daily opens directly from backend when App Group is empty.
-    static func fetchDailyOpensFromBackend() async -> [String: Double] {
-        guard let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/daily-opens") else { return [:] }
+    /// - Parameter fresh: When true, appends ?fresh=1 to bypass backend cache.
+    static func fetchDailyOpensFromBackend(fresh: Bool = false) async -> [String: Double] {
+        let suffix = fresh ? "?fresh=1" : ""
+        guard let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/daily-opens\(suffix)") else { return [:] }
         var request = URLRequest(url: url, timeoutInterval: 8)
+        if fresh { request.cachePolicy = .reloadIgnoringLocalCacheData }
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -938,9 +944,9 @@ struct RefreshMarketsIntent: AppIntent {
                                 volume24h: volume, iconData: nil, iconName: iconName)
         }
 
-        // Fetch HL prices + custom chart prices in parallel
+        // Fetch HL prices + custom chart prices in parallel — fresh=true bypasses backend cache
         let customCharts = SharedMarketReader.loadCustomCharts()
-        async let hlTask = SharedMarketReader.fetchAllMidsFallback(markets: markets)
+        async let hlTask = SharedMarketReader.fetchAllMidsFallback(markets: markets, fresh: true)
         async let customTask = SharedMarketReader.fetchCustomChartPrices(customCharts)
 
         let freshPrices = await hlTask

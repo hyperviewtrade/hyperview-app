@@ -101,8 +101,11 @@ struct HyperliquidTVApp: App {
         configureAppearance()
         KeyboardDoneBarSetup.install()
         IconCacheService.shared.refreshIfNeeded()
-        // Fetch HIP-3 display names (CL→WTICRUDE, etc.)
-        Task { await HIP3AnnotationCache.shared.fetchAnnotations() }
+
+        // Connect backend relay at app launch
+        RelayClient.shared.connect()
+
+        // HIP-3 display names fetched later by MarketsViewModel (Phase 2 background task)
     }
 
     var body: some Scene {

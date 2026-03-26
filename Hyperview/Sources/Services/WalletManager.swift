@@ -800,9 +800,8 @@ final class WalletManager: ObservableObject {
     private func fetchHIP3Positions() async {
         guard let address = connectedWallet?.address else { return }
 
-        // Try batch endpoint first (single request replaces N+1)
         do {
-            let url = URL(string: "\(Configuration.backendBaseURL)/hip3-positions")!
+            let url = URL(string: "\(Configuration.ingestionBaseURL)/hip3-positions")!
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -816,61 +815,112 @@ final class WalletManager: ObservableObject {
                 throw APIError.serverError((response as? HTTPURLResponse)?.statusCode ?? 0)
             }
 
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let positionsArray = json["positions"] as? [[String: Any]]
-            else { return }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+
+            let positionsArray: [[String: Any]]
+            if let arr = json["positions"] as? [[String: Any]] {
+                positionsArray = arr
+            } else if let arr = json["data"] as? [[String: Any]] {
+                positionsArray = arr
+            } else {
+                print("[HIP3-DEBUG] Response: \(data.count) bytes, status 200")
+                print("[HIP3-DEBUG] Could not find positions array in JSON keys: \(Array(json.keys))")
+                hip3Positions = []
+                mergePositions()
+                print("⚡ Backend HIP-3: 0 markets from 1 request")
+                return
+            }
 
             var positions: [PerpPosition] = []
-            for pos in positionsArray {
+
+            for entry in positionsArray {
+                let pos: [String: Any]
+
+                if let directPos = entry["position"] as? [String: Any] {
+                    pos = directPos
+                } else if let assetPositions = entry["assetPositions"] as? [[String: Any]],
+                          let firstWrapper = assetPositions.first,
+                          let nestedPos = firstWrapper["position"] as? [String: Any] {
+                    pos = nestedPos
+                } else {
+                    pos = entry
+                }
+
                 guard let coin = pos["coin"] as? String,
                       let sziStr = pos["szi"] as? String,
                       let szi = Double(sziStr), abs(szi) > 0.0000001,
                       let entryStr = pos["entryPx"] as? String,
-                      let entry = Double(entryStr)
-                else { continue }
+                      let entryPx = Double(entryStr) else {
+                    continue
+                }
 
                 let posValue = (pos["positionValue"] as? String).flatMap(Double.init) ?? 0
                 let pnl = (pos["unrealizedPnl"] as? String).flatMap(Double.init) ?? 0
                 let liqPx = (pos["liquidationPx"] as? String).flatMap(Double.init)
-                let levVal = pos["leverage"] as? Int ?? 1
-                let isCross = (pos["isCross"] as? Bool) ?? true
                 let marginUsed = (pos["marginUsed"] as? String).flatMap(Double.init) ?? 0
-                let funding = (pos["cumulativeFunding"] as? String).flatMap(Double.init) ?? 0
 
-                positions.append(PerpPosition(
-                    coin: coin,
-                    size: szi,
-                    entryPrice: entry,
-                    markPrice: posValue / max(abs(szi), 0.000001),
-                    unrealizedPnl: pnl,
-                    leverage: levVal,
-                    isCross: isCross,
-                    marginUsed: marginUsed,
-                    liquidationPx: liqPx,
-                    cumulativeFunding: funding,
-                    szDecimals: MarketsViewModel.szDecimals(for: coin)
-                ))
+                let leverageValue: Int = {
+                    if let lev = pos["leverage"] as? Int { return lev }
+                    if let lev = pos["leverage"] as? [String: Any],
+                       let value = lev["value"] as? Int { return value }
+                    return 1
+                }()
+
+                let isCross: Bool = {
+                    if let cross = pos["isCross"] as? Bool { return cross }
+                    if let lev = pos["leverage"] as? [String: Any] {
+                        return (lev["type"] as? String ?? "cross") == "cross"
+                    }
+                    return true
+                }()
+
+                let cumulativeFunding: Double = {
+                    if let funding = (pos["cumulativeFunding"] as? String).flatMap(Double.init) {
+                        return funding
+                    }
+                    if let fundingStr = (pos["cumFunding"] as? [String: Any])?["sinceOpen"] as? String,
+                       let funding = Double(fundingStr) {
+                        return funding
+                    }
+                    return 0
+                }()
+
+                positions.append(
+                    PerpPosition(
+                        coin: coin,
+                        size: szi,
+                        entryPrice: entryPx,
+                        markPrice: posValue / max(abs(szi), 0.000001),
+                        unrealizedPnl: pnl,
+                        leverage: leverageValue,
+                        isCross: isCross,
+                        marginUsed: marginUsed,
+                        liquidationPx: liqPx,
+                        cumulativeFunding: cumulativeFunding,
+                        szDecimals: MarketsViewModel.szDecimals(for: coin)
+                    )
+                )
             }
 
             hip3Positions = positions
             mergePositions()
+            print("⚡ Backend HIP-3: \(positions.count) markets from 1 request")
 
         } catch {
-            // Fallback to direct HL API if backend is down
             print("[HIP3] Backend batch failed, falling back to direct: \(error.localizedDescription)")
             let states = await HyperliquidAPI.shared.fetchHIP3States(address: address)
             var positions: [PerpPosition] = []
 
             for (_, state) in states {
                 guard let assetPositions = state["assetPositions"] as? [[String: Any]] else { continue }
+
                 for wrapper in assetPositions {
                     guard let pos = wrapper["position"] as? [String: Any],
                           let coin = pos["coin"] as? String,
                           let sziStr = pos["szi"] as? String,
                           let szi = Double(sziStr), abs(szi) > 0.0000001,
                           let entryStr = pos["entryPx"] as? String,
-                          let entry = Double(entryStr)
-                    else { continue }
+                          let entry = Double(entryStr) else { continue }
 
                     let posValue = (pos["positionValue"] as? String).flatMap(Double.init) ?? 0
                     let pnl = (pos["unrealizedPnl"] as? String).flatMap(Double.init) ?? 0
@@ -881,19 +931,21 @@ final class WalletManager: ObservableObject {
                     let fundingStr = (pos["cumFunding"] as? [String: Any])?["sinceOpen"] as? String
                     let cumulFunding = fundingStr.flatMap(Double.init) ?? 0
 
-                    positions.append(PerpPosition(
-                        coin: coin,
-                        size: szi,
-                        entryPrice: entry,
-                        markPrice: posValue / max(abs(szi), 0.000001),
-                        unrealizedPnl: pnl,
-                        leverage: levVal,
-                        isCross: isCross,
-                        marginUsed: marginUsed,
-                        liquidationPx: liqPx,
-                        cumulativeFunding: cumulFunding,
-                        szDecimals: MarketsViewModel.szDecimals(for: coin)
-                    ))
+                    positions.append(
+                        PerpPosition(
+                            coin: coin,
+                            size: szi,
+                            entryPrice: entry,
+                            markPrice: posValue / max(abs(szi), 0.000001),
+                            unrealizedPnl: pnl,
+                            leverage: levVal,
+                            isCross: isCross,
+                            marginUsed: marginUsed,
+                            liquidationPx: liqPx,
+                            cumulativeFunding: cumulFunding,
+                            szDecimals: MarketsViewModel.szDecimals(for: coin)
+                        )
+                    )
                 }
             }
 
@@ -901,7 +953,6 @@ final class WalletManager: ObservableObject {
             mergePositions()
         }
     }
-
     /// Creates a brand new wallet: backs up the old key, generates a fresh random one,
     /// and resets onboarding so the user sees the key backup screen.
     /// SECURITY: Uses SecRandomCopyBytes (CSPRNG) — every call produces a unique 256-bit key.
@@ -1269,18 +1320,18 @@ final class WalletManager: ObservableObject {
         // Use backend /wallet/:address — one request, backend handles HL API rate limits
         let backendURL = URL(string: "\(Self.backendBaseURL)/wallet/\(address)")!
         var req = URLRequest(url: backendURL)
-        req.timeoutInterval = 15
+req.timeoutInterval = 15
 
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+do {
+    let (data, _) = try await URLSession.shared.data(for: req)
+    guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
 
-            // Parse perp account value
-            if let state = json["state"] as? [String: Any],
-               let marginSummary = state["marginSummary"] as? [String: Any],
-               let valStr = marginSummary["accountValue"] as? String,
-               let val = Double(valStr) {
-                perpValue = val
+    // Parse perp account value
+    if let state = json["state"] as? [String: Any],
+       let marginSummary = state["marginSummary"] as? [String: Any],
+       let valStr = marginSummary["accountValue"] as? String,
+       let val = Double(valStr) {
+        perpValue = val
 
                 // Daily PnL will be fetched from portfolio API below
             }

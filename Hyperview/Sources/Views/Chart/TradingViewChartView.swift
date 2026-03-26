@@ -26,6 +26,15 @@ struct TradingViewChartView: UIViewRepresentable {
         context.coordinator.webView = webView
         context.coordinator.chartVM = chartVM
 
+        // Prefetch candles NOW — starts the API call immediately while WebView
+        // parses 25MB of TradingView JS. By the time getBars fires, data is ready.
+        if !chartVM.isCustomTVChart {
+            context.coordinator.prefetchCandles(
+                symbol: chartVM.selectedSymbol,
+                interval: chartVM.selectedInterval
+            )
+        }
+
         // Load the HTML from TradingView subfolder (copied by build script)
         let tvDir = Bundle.main.bundleURL.appendingPathComponent("TradingView")
         let htmlURL = tvDir.appendingPathComponent("tradingview.html")
@@ -79,6 +88,72 @@ struct TradingViewChartView: UIViewRepresentable {
         private var subscribedSymbol: String?
         private var subscribedInterval: String?
 
+        // MARK: - Candle Prefetch
+        // Single shared Task per symbol — getBars awaits it instead of making a 2nd request.
+        // Key insight: prefetch starts in makeUIView (before JS loads), getBars just awaits the result.
+
+        /// The active prefetch task. getBars can `await` this instead of making a duplicate call.
+        private var activePrefetch: (key: String, task: Task<[Candle], Error>)?
+
+        /// In-memory LRU cache for previously viewed coins.
+        private static var candleCache: [String: (candles: [Candle], date: Date)] = [:]
+        private static let maxCacheEntries = 8
+        private static let cacheMaxAge: TimeInterval = 120 // 2 min
+
+        /// Start prefetching candles. If already in-flight for same key, no-op.
+        func prefetchCandles(symbol: String, interval: ChartInterval) {
+            let key = "\(symbol):\(interval.rawValue)"
+
+            // Already cached and fresh? Nothing to do.
+            if let cached = Self.candleCache[key], Date().timeIntervalSince(cached.date) < Self.cacheMaxAge {
+                return
+            }
+
+            // Already prefetching this exact key? Don't duplicate.
+            if activePrefetch?.key == key { return }
+
+            // Cancel previous prefetch (different symbol)
+            activePrefetch?.task.cancel()
+
+            let task = Task<[Candle], Error> {
+                let candles = try await HyperliquidAPI.shared.fetchCandles(coin: symbol, interval: interval)
+                // Store in cache
+                if Self.candleCache.count >= Self.maxCacheEntries {
+                    let oldest = Self.candleCache.min(by: { $0.value.date < $1.value.date })
+                    if let k = oldest?.key { Self.candleCache.removeValue(forKey: k) }
+                }
+                Self.candleCache[key] = (candles, Date())
+                return candles
+            }
+
+            activePrefetch = (key, task)
+        }
+
+        /// Get candles: returns from cache, awaits in-flight prefetch, or fetches fresh.
+        /// This is the SINGLE source of truth — never duplicates a request.
+        func getCandles(symbol: String, interval: ChartInterval) async throws -> [Candle] {
+            let key = "\(symbol):\(interval.rawValue)"
+
+            // 1. Check memory cache
+            if let cached = Self.candleCache[key], Date().timeIntervalSince(cached.date) < Self.cacheMaxAge {
+                return cached.candles
+            }
+
+            // 2. Await in-flight prefetch if it matches
+            if let prefetch = activePrefetch, prefetch.key == key {
+                return try await prefetch.task.value
+            }
+
+            // 3. No prefetch in flight — fetch now (and cache)
+            let candles = try await HyperliquidAPI.shared.fetchCandles(coin: symbol, interval: interval)
+            if Self.candleCache.count >= Self.maxCacheEntries {
+                let oldest = Self.candleCache.min(by: { $0.value.date < $1.value.date })
+                if let k = oldest?.key { Self.candleCache.removeValue(forKey: k) }
+            }
+            Self.candleCache[key] = (candles, Date())
+            return candles
+        }
+
         // MARK: - WKNavigationDelegate
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -86,6 +161,8 @@ struct TradingViewChartView: UIViewRepresentable {
             let symbol = vm.selectedSymbol
             currentSymbol = symbol
             let isCustom = vm.isCustomTVChart
+            currentIsCustom = isCustom
+
             let interval = Self.hlIntervalToTV(vm.selectedInterval)
             let js = "initChart('\(Self.escapeJS(symbol))', '\(interval)', 'dark', \(isCustom));"
             webView.evaluateJavaScript(js)
@@ -312,15 +389,18 @@ struct TradingViewChartView: UIViewRepresentable {
             Task { @MainActor in
                 do {
                     let hlInterval = ChartInterval(rawValue: interval) ?? .oneHour
-                    let api = HyperliquidAPI.shared
                     let startMs = Int64(from) * 1000
                     let endMs   = Int64(to) * 1000
 
                     var candles: [Candle]
+
                     if firstDataRequest {
-                        candles = try await api.fetchCandles(coin: symbol, interval: hlInterval)
+                        // Uses cache → awaits in-flight prefetch → or fetches fresh.
+                        // NEVER duplicates a request.
+                        candles = try await getCandles(symbol: symbol, interval: hlInterval)
                     } else {
-                        candles = try await api.fetchCandlesRange(
+                        // Scrolling back in history — always fresh range fetch
+                        candles = try await HyperliquidAPI.shared.fetchCandlesRange(
                             coin: symbol, interval: hlInterval,
                             startMs: startMs, endMs: endMs
                         )
@@ -1298,6 +1378,10 @@ struct TradingViewChartView: UIViewRepresentable {
         // MARK: - Public API
 
         func changeSymbol(_ symbol: String, interval: ChartInterval, isCustom: Bool = false) {
+            // Prefetch candles immediately — runs in parallel with TV's symbol switch animation
+            if !isCustom {
+                prefetchCandles(symbol: symbol, interval: interval)
+            }
             let tvInterval = Self.hlIntervalToTV(interval)
             let js = "changeSymbol('\(Self.escapeJS(symbol))', '\(tvInterval)', \(isCustom));"
             webView?.evaluateJavaScript(js)

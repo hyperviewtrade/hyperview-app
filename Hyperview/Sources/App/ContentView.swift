@@ -176,10 +176,13 @@ struct ContentView: View {
         // Load markets from the root view — ContentView never disappears,
         // so this Task is never cancelled by tab switching.
         .task { await marketsVM.loadMarkets() }
-        // Pre-load leaderboard from backend (lightweight)
-        .task { await LeaderboardViewModel.shared.load() }
-        // Fetch HIP-3 display names (CL→WTICRUDE, etc.)
-        .task { await HIP3AnnotationCache.shared.fetchAnnotations() }
+        // All non-critical prefetches fire-and-forget — don't hold main actor
+        .task {
+            // These run concurrently, none blocks the others
+            async let _ = LeaderboardViewModel.shared.load()
+            UnstakingViewModel.shared.prefetch()
+            async let _ = RelativePerformanceViewModel.shared.load()
+        }
 
             // Onboarding overlay — blocks entire UI on first launch
             if !wallet.hasCompletedOnboarding {

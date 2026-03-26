@@ -70,17 +70,22 @@ struct HomeView: View {
             HomeSettingsSheet()
         }
         .task {
-            while marketsVM.markets.isEmpty && marketsVM.isLoading {
-                try? await Task.sleep(nanoseconds: 200_000_000)
+            // Start feed immediately — don't block on markets loading
+            if !marketsVM.markets.isEmpty {
+                vm.start(markets: marketsVM.markets)
             }
-            vm.start(markets: marketsVM.markets)
-            await loadGlobalAliases()
+            // Load aliases in background (non-blocking)
+            Task { await loadGlobalAliases() }
             // Pre-fetch leaderboard + whale positions in background
             Task.detached(priority: .userInitiated) {
-                // Load and parse leaderboard (also caches raw data for whale positions)
                 await LeaderboardViewModel.shared.load()
-                // Once leaderboard is cached, pre-load whale positions
                 await LargestPositionsViewModel.shared.load()
+            }
+        }
+        .onChange(of: marketsVM.markets.count) { _, count in
+            // Start feed as soon as markets become available (reactive, no polling)
+            if count > 0 && !vm.isLive {
+                vm.start(markets: marketsVM.markets)
             }
         }
         // ── Sheets ──────────────────────────────────────────────

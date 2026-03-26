@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct HomeRelativePerformanceCard: View {
-    @StateObject private var vm = RelativePerformanceViewModel()
+    @ObservedObject private var vm = RelativePerformanceViewModel.shared
 
     private let timeframes = RelativePerformanceViewModel.Timeframe.allCases
 
@@ -75,7 +75,10 @@ struct HomeRelativePerformanceCard: View {
                         .stroke(Color(white: 0.18), lineWidth: 1)
                 )
         )
-        .task { await vm.load() }
+        .task {
+            // Cache loads instantly in init — only fetch if stale or empty
+            await vm.load()
+        }
     }
 
     // MARK: - Row

@@ -5,6 +5,8 @@ import Combine
 @MainActor
 final class UnstakingViewModel: ObservableObject {
 
+    static let shared = UnstakingViewModel()
+
     // MARK: - Published state
 
     @Published var queueEntries: [UnstakingQueueEntry] = []
@@ -33,9 +35,34 @@ final class UnstakingViewModel: ObservableObject {
 
     private let session = URLSession.shared
 
+    /// The in-flight prefetch task, so callers can await it instead of bailing.
+    private var activeLoadTask: Task<Void, Never>?
+
+    // MARK: - Prefetch (call from splash)
+
+    /// Starts loading in background. Returns immediately.
+    func prefetch() {
+        guard activeLoadTask == nil else { return }
+        activeLoadTask = Task { await _doLoad() }
+    }
+
+    /// Awaits the in-flight prefetch, or loads if nothing was started yet.
+    func ensureLoaded() async {
+        if let task = activeLoadTask {
+            await task.value              // wait for prefetch to finish
+        }
+        if queueEntries.isEmpty {
+            await _doLoad()               // prefetch failed or never ran — retry
+        }
+    }
+
     // MARK: - Load all
 
     func loadAll() async {
+        await _doLoad()
+    }
+
+    private func _doLoad() async {
         guard !isLoading else { return }
         isLoading = true
         errorMsg = nil
@@ -55,7 +82,8 @@ final class UnstakingViewModel: ObservableObject {
 
     func refresh() async {
         isLoading = false
-        await loadAll()
+        activeLoadTask = nil
+        await _doLoad()
     }
 
     // MARK: - Sort & Filter

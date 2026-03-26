@@ -5,6 +5,8 @@ import Combine
 @MainActor
 final class RelativePerformanceViewModel: ObservableObject {
 
+    static let shared = RelativePerformanceViewModel()
+
     // MARK: - Types
 
     enum Timeframe: String, CaseIterable {
@@ -56,12 +58,31 @@ final class RelativePerformanceViewModel: ObservableObject {
 
     private let api = HyperliquidAPI.shared
 
+    // MARK: - Disk cache keys
+
+    private static let cacheKey = "relative_perf_cache"
+    private static let cacheTimeKey = "relative_perf_time"
+    private static let cacheTTL: TimeInterval = 300 // 5 min — data doesn't change fast
+
+    // MARK: - Init (load cache immediately)
+
+    private init() {
+        loadFromCache()
+    }
+
     // MARK: - Load all timeframes at once
 
     func load() async {
         guard !isLoading else { return }
         isLoading = true
+        // Do NOT clear rows — keep cached/stale data visible during refresh
         defer { isLoading = false }
+
+        // Skip fetch if cache is fresh enough
+        let cacheAge = Date().timeIntervalSince1970 - UserDefaults.standard.double(forKey: Self.cacheTimeKey)
+        if !rows.isEmpty && cacheAge < Self.cacheTTL {
+            return
+        }
 
         let allCoins = ["HYPE"] + Self.comparisonCoins
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -98,7 +119,6 @@ final class RelativePerformanceViewModel: ObservableObject {
                 let hypeKey = "HYPE:\(tf.rawValue)"
                 let coinKey = "\(coin):\(tf.rawValue)"
                 if let hc = changeMap[hypeKey], let cc = changeMap[coinKey], (1 + cc) != 0 {
-                    // Correct ratio formula: HYPE/COIN relative performance
                     relMap[tf] = (1 + hc) / (1 + cc) - 1
                 }
             }
@@ -107,8 +127,48 @@ final class RelativePerformanceViewModel: ObservableObject {
             }
         }
 
-        unsortedRows = result
-        applySorting()
+        // Only update if we got data (never downgrade to empty)
+        if !result.isEmpty {
+            unsortedRows = result
+            applySorting()
+            saveToCache(result)
+        }
+    }
+
+    // MARK: - Cache persistence
+
+    private func loadFromCache() {
+        guard let arr = UserDefaults.standard.array(forKey: Self.cacheKey) as? [[String: Any]] else { return }
+        var result: [CoinRow] = []
+        for dict in arr {
+            guard let symbol = dict["s"] as? String,
+                  let relDict = dict["r"] as? [String: Double] else { continue }
+            var relMap: [Timeframe: Double] = [:]
+            for (tfRaw, val) in relDict {
+                if let tf = Timeframe(rawValue: tfRaw) {
+                    relMap[tf] = val
+                }
+            }
+            if !relMap.isEmpty {
+                result.append(CoinRow(symbol: symbol, relativeByTF: relMap))
+            }
+        }
+        if !result.isEmpty {
+            unsortedRows = result
+            applySorting()
+        }
+    }
+
+    private func saveToCache(_ rows: [CoinRow]) {
+        let arr: [[String: Any]] = rows.map { row in
+            var relDict: [String: Double] = [:]
+            for (tf, val) in row.relativeByTF {
+                relDict[tf.rawValue] = val
+            }
+            return ["s": row.symbol, "r": relDict]
+        }
+        UserDefaults.standard.set(arr, forKey: Self.cacheKey)
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cacheTimeKey)
     }
 
     func toggleSort(_ tf: Timeframe) {

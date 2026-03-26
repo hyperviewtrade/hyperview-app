@@ -2,7 +2,7 @@ import SwiftUI
 
 struct HomeUnstakingCard: View {
     @Binding var showFullUnstaking: Bool
-    @StateObject private var vm = UnstakingViewModel()
+    @ObservedObject private var vm = UnstakingViewModel.shared
 
     enum SortField { case time, amount }
     @State private var sortField: SortField = .amount
@@ -105,7 +105,10 @@ struct HomeUnstakingCard: View {
                         .stroke(Color(white: 0.18), lineWidth: 1)
                 )
         )
-        .task { await vm.loadAll() }
+        .task {
+            // Await the in-flight prefetch (started during splash), or load fresh if needed
+            await vm.ensureLoaded()
+        }
     }
 
     // MARK: - Unstaking row

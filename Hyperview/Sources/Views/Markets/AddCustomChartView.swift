@@ -1,7 +1,7 @@
 import SwiftUI
 import Combine
 
-// MARK: - TradingView Symbol Search API
+// MARK: - Symbol Search (Direct Exchange APIs via ExchangeSymbolIndex)
 
 private struct TVSearchResult: Identifiable {
     let id = UUID()
@@ -200,107 +200,30 @@ private final class TVSearchViewModel: ObservableObject {
         denominatorTask?.cancel()
     }
 
-    // MARK: - API
+    // MARK: - API (powered by ExchangeSymbolIndex — no TradingView dependency)
 
     static func fetchSymbols(query: String) async throws -> [TVSearchResult] {
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        let urlStr = "https://symbol-search.tradingview.com/symbol_search/v3/?text=\(encoded)&hl=0&exchange=&lang=en&search_type=undefined&domain=production&sort_by_country=US"
-
-        guard let url = URL(string: urlStr) else { return [] }
-
-        var request = URLRequest(url: url)
-        request.setValue("https://www.tradingview.com", forHTTPHeaderField: "Origin")
-        request.timeoutInterval = 10
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-
-        // The API returns a JSON object with "symbols" array
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let symbols = json["symbols"] as? [[String: Any]] else {
-            return []
-        }
-
-        return symbols.prefix(40).compactMap { item -> TVSearchResult? in
-            guard let symbol = item["symbol"] as? String,
-                  let exchange = item["exchange"] as? String else { return nil }
-
-            let desc = item["description"] as? String ?? ""
-            let type = item["type"] as? String ?? ""
-            let prefix = item["prefix"] as? String ?? exchange
-            let fullName = "\(prefix):\(symbol)"
-
-            return TVSearchResult(
-                symbol: symbol,
-                fullName: fullName,
-                description: desc,
-                exchange: prefix,
-                type: type
+        let results = await ExchangeSymbolIndex.shared.search(query: query, limit: 40)
+        return results.map { indexed in
+            TVSearchResult(
+                symbol: indexed.symbol,
+                fullName: "\(indexed.exchange):\(indexed.symbol)",
+                description: indexed.description,
+                exchange: indexed.exchange,
+                type: indexed.type
             )
         }
     }
 
-    /// Fetch results for a symbol and group by exchange to find all available sources
+    /// Find all exchanges that list a given symbol
     static func fetchGroupedExchanges(query: String) async throws -> TVSymbolExchanges? {
-        let results = try await fetchSymbols(query: query)
-        guard !results.isEmpty else { return nil }
-
-        // Find the best matching symbol (exact match preferred)
-        let upperQuery = query.uppercased()
-        let bestMatch = results.first(where: { $0.symbol.uppercased() == upperQuery }) ?? results[0]
-        let matchSymbol = bestMatch.symbol
-
-        // Collect all exchanges that offer this exact symbol
-        let exchanges = results
-            .filter { $0.symbol.uppercased() == matchSymbol.uppercased() }
-            .map(\.exchange)
-
-        // Deduplicate while preserving order
-        var seen = Set<String>()
-        var uniqueExchanges = exchanges.filter { seen.insert($0).inserted }
-
-        // Check if this symbol exists on Hyperliquid and add it as a source
-        if let hlCoin = extractHLCoin(from: upperQuery),
-           await checkHyperliquidAvailability(coin: hlCoin) {
-            uniqueExchanges.insert("HYPERLIQUID", at: 0)
-        }
-
+        guard let result = await ExchangeSymbolIndex.shared.exchanges(for: query) else { return nil }
         return TVSymbolExchanges(
-            symbol: matchSymbol,
-            description: bestMatch.description,
-            type: bestMatch.type,
-            exchanges: uniqueExchanges
+            symbol: result.symbol,
+            description: result.description,
+            type: result.type,
+            exchanges: result.exchanges
         )
-    }
-
-    /// Try to extract a Hyperliquid coin name from a query like "BTCUSDT" → "BTC", "ETH" → "ETH"
-    private static func extractHLCoin(from query: String) -> String? {
-        let stables = ["USDT", "USDC", "BUSD", "USD", "PERP"]
-        for suffix in stables {
-            if query.hasSuffix(suffix) && query.count > suffix.count {
-                return String(query.dropLast(suffix.count))
-            }
-        }
-        return query  // Could be just "BTC", "ETH", etc.
-    }
-
-    /// Check if a coin is available on Hyperliquid by querying the allMids endpoint
-    private static func checkHyperliquidAvailability(coin: String) async -> Bool {
-        guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return false }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 5
-        guard let body = try? JSONSerialization.data(withJSONObject: ["type": "allMids"]) else { return false }
-        req.httpBody = body
-
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-            // allMids returns { "BTC": "67500.0", "ETH": "3200.0", ... }
-            return json[coin] != nil
-        } catch {
-            return false
-        }
     }
 }
 
@@ -412,7 +335,7 @@ struct AddCustomChartView: View {
                 } else if searchVM.isSearching && searchVM.results.isEmpty {
                     HStack(spacing: 8) {
                         ProgressView().tint(.white).scaleEffect(0.8)
-                        Text("Searching TradingView…")
+                        Text("Searching…")
                             .font(.system(size: 13))
                             .foregroundColor(Color(white: 0.4))
                     }

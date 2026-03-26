@@ -439,57 +439,56 @@ final class MarketsViewModel: ObservableObject {
             isLoading = false
             print("⚡ Phase 1: \(markets.count) markets visible")
 
-            // Fetch daily opens from backend (1 request, no HL rate limit)
-            Task { [weak self] in
-                await self?.fetchAndApplyDailyOpens()
-            }
-
-            // ── Phase 2: HIP-3 ──
-            // 1. Load from local cache INSTANTLY (no network)
+            // Load HIP-3 from disk cache INSTANTLY (no network) — adds markets immediately
             let cachedHIP3 = loadCachedHIP3Markets(api: api)
             if !cachedHIP3.isEmpty {
                 publishMarkets(perps: mainPerps + cachedHIP3, spots: spotMarkets)
-                print("⚡ Phase 2 (cache): +\(cachedHIP3.count) HIP-3 → \(markets.count) total")
+                print("⚡ Phase 1b (cache): +\(cachedHIP3.count) HIP-3 → \(markets.count) total")
             }
 
-            // 2. Update from backend in background (delayed 3s to not compete with balance)
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            var hip3Markets = await api.fetchHIP3MarketsFromBackend()
-            if hip3Markets.isEmpty {
-                // Fallback: fetch directly from HL API (sequential with delay to avoid rate limit)
-                let hip3Dexes = await api.fetchPerpDexNamesWithIndices()
-                for dex in hip3Dexes {
-                    if let m = try? await api.fetchMarketsForDex(dex.name, perpDexIdx: dex.perpDexIdx) {
-                        hip3Markets.append(contentsOf: m)
+            // ── Phase 2+: everything else runs in background (fire-and-forget) ──
+            // This lets loadMarkets() return immediately so ContentView/.task unblocks.
+            Task { [weak self] in
+                guard let self else { return }
+
+                // Fetch daily opens from backend (1 request, no HL rate limit)
+                await self.fetchAndApplyDailyOpens()
+
+                // Delayed HIP-3 fresh fetch (3s to not compete with balance)
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                var hip3Markets = await api.fetchHIP3MarketsFromBackend()
+                if hip3Markets.isEmpty {
+                    let hip3Dexes = await api.fetchPerpDexNamesWithIndices()
+                    for dex in hip3Dexes {
+                        if let m = try? await api.fetchMarketsForDex(dex.name, perpDexIdx: dex.perpDexIdx) {
+                            hip3Markets.append(contentsOf: m)
+                        }
+                        try? await Task.sleep(nanoseconds: 200_000_000)
                     }
-                    try? await Task.sleep(nanoseconds: 200_000_000) // 200ms between DEX fetches
                 }
-            }
-            // Fallback safety: if fresh fetch returned 0, keep cached markets
-            if hip3Markets.isEmpty {
-                let cached = loadCachedHIP3Markets(api: api)
-                if !cached.isEmpty {
-                    hip3Markets = cached
-                    print("⚡ HIP-3: fresh fetch empty, keeping \(cached.count) cached markets")
+                if hip3Markets.isEmpty {
+                    let cached = self.loadCachedHIP3Markets(api: api)
+                    if !cached.isEmpty {
+                        hip3Markets = cached
+                        print("⚡ HIP-3: fresh fetch empty, keeping \(cached.count) cached markets")
+                    }
                 }
-            }
-            // Only update if we got MORE hip3 than what's cached (never downgrade)
-            let currentHIP3Count = markets.filter { $0.isHIP3 }.count
-            if !hip3Markets.isEmpty && hip3Markets.count >= max(currentHIP3Count - 5, 10) {
-                publishMarkets(perps: mainPerps + hip3Markets, spots: spotMarkets)
-                // Save to cache if we got any markets (even partial is better than nothing)
-                if hip3Markets.count > 10 {
-                    saveCachedHIP3Markets(hip3Markets, api: api)
+                let currentHIP3Count = self.markets.filter { $0.isHIP3 }.count
+                if !hip3Markets.isEmpty && hip3Markets.count >= max(currentHIP3Count - 5, 10) {
+                    self.publishMarkets(perps: mainPerps + hip3Markets, spots: spotMarkets)
+                    if hip3Markets.count > 10 {
+                        self.saveCachedHIP3Markets(hip3Markets, api: api)
+                    }
+                    print("⚡ Phase 2 (fresh): +\(hip3Markets.count) HIP-3 → \(markets.count) total")
                 }
-                print("⚡ Phase 2 (fresh): +\(hip3Markets.count) HIP-3 → \(markets.count) total")
-            }
 
-            // Phase 3: Fetch HIP-3 display names + global aliases
-            await HIP3AnnotationCache.shared.fetchAnnotations()
-            await AliasCache.shared.fetchAliases()
+                // Phase 3: HIP-3 display names + global aliases
+                await HIP3AnnotationCache.shared.fetchAnnotations()
+                await AliasCache.shared.fetchAliases()
 
-            // Phase 4: Pre-fetch HIP-4 outcome markets from testnet (non-blocking)
-            Task { [weak self] in await self?.loadOutcomeMarkets() }
+                // Phase 4: Outcome markets
+                await self.loadOutcomeMarkets()
+            }
 
         } catch {
             print("❌ Markets: \(error)")

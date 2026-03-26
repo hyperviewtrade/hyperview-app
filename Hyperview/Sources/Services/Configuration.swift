@@ -15,7 +15,7 @@ struct Configuration {
     static let environment: AppEnvironment = .production
     #endif
 
-    // MARK: - Backend URLs
+    // MARK: - Main backend URLs
 
     static var backendBaseURL: String {
         switch environment {
@@ -24,7 +24,20 @@ struct Configuration {
         case .staging:
             return "https://hyperview-backend-staging.up.railway.app"
         case .development:
-            return "https://hyperview-backend-production-075c.up.railway.app" // Use prod for now
+            return "https://hyperview-backend-production-075c.up.railway.app"
+        }
+    }
+
+    // MARK: - Ingestion backend URLs
+
+    static var ingestionBaseURL: String {
+        switch environment {
+        case .production:
+            return "https://joyful-perception-production.up.railway.app"
+        case .staging:
+            return "https://joyful-perception-production.up.railway.app"
+        case .development:
+            return "https://joyful-perception-production.up.railway.app"
         }
     }
 
@@ -40,11 +53,11 @@ struct Configuration {
     static var relayWSURL: String {
         switch environment {
         case .production:
-            return "wss://hyperview-relay-production.up.railway.app/relay"
+            return "wss://harmonious-energy-production-46a9.up.railway.app/relay"
         case .staging:
             return "wss://hyperview-relay-staging.up.railway.app/relay"
         case .development:
-            return "" // Disabled in dev — use direct HL connections
+            return "wss://harmonious-energy-production-46a9.up.railway.app/relay"
         }
     }
 
