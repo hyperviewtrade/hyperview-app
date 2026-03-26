@@ -764,7 +764,12 @@ private enum SharedMarketReader {
 
     /// Lightweight fallback: fetch only allMids (much smaller payload than metaAndAssetCtxs)
     static func fetchAllMidsFallback(markets: [WidgetMarket], fresh: Bool = false) async -> [String: (price: Double, change: Double, volume: Double)] {
-        let dailyOpens = fresh ? await fetchDailyOpensFromBackend(fresh: true) : loadDailyOpens()
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // Daily opens change once per day — always use cached values for fast refresh.
+        // They're kept up-to-date by the timeline provider and main app.
+        let dailyOpens = loadDailyOpens()
+
         let hip3Markets = markets.filter { $0.symbol.contains(":") }
         let hasHIP3 = !hip3Markets.isEmpty
 
@@ -776,19 +781,28 @@ private enum SharedMarketReader {
             return dex.isEmpty ? nil : dex
         })
 
-        // Launch ALL fetches in parallel
+        if hasHIP3 {
+            print("[WIDGET HAS HIP3] YES — dexes: \(neededDexes.sorted()) symbols: \(hip3Markets.map(\.symbol))")
+        }
+
+        // Launch ALL fetches in parallel — allMids (normal) + HIP-3 direct from HL
+        // When fresh (refresh tap): fetch HIP-3 directly from HL API (fast, no backend dependency)
+        // When not fresh (timeline): try backend cache first (lighter on HL rate limits)
         async let midsTask = fetchAllMids()
-        async let hip3Task: [String: Double] = hasHIP3 ? fetchHIP3Prices(fresh: fresh, neededDexes: neededDexes) : [:]
+        async let hip3Task: [String: Double] = hasHIP3
+            ? (fresh ? fetchHIP3Direct(dexes: neededDexes) : fetchHIP3FromBackend(dexes: neededDexes))
+            : [:]
 
         let mids = await midsTask
         let hip3Prices = await hip3Task
 
-        // XYZ debug: log what hip3Prices contains
-        let xyzKeys = hip3Prices.keys.filter { $0.hasPrefix("xyz") }
-        if !xyzKeys.isEmpty {
-            print("[XYZ RESPONSE KEYS] hip3Prices contains \(xyzKeys.count) xyz keys: \(xyzKeys.sorted().joined(separator: ", "))")
-        } else if hasHIP3 {
-            print("[XYZ RESPONSE KEYS] hip3Prices has NO xyz keys! All keys: \(hip3Prices.keys.sorted().prefix(20).joined(separator: ", "))")
+        let t1 = CFAbsoluteTimeGetCurrent()
+        print("[WIDGET FETCH DONE] \(String(format: "%.0f", (t1 - t0) * 1000))ms — mids=\(mids.count) hip3=\(hip3Prices.count)")
+
+        // Debug: log HIP-3 keys
+        if hasHIP3 {
+            let hip3Keys = hip3Prices.keys.sorted()
+            print("[HIP3 RESPONSE KEYS] \(hip3Keys.count) keys: \(hip3Keys.prefix(20).joined(separator: ", "))")
         }
 
         var result: [String: (price: Double, change: Double, volume: Double)] = [:]
@@ -801,14 +815,15 @@ private enum SharedMarketReader {
                 price = Double(priceStr)
             }
 
-            // HIP-3: from backend/HL DEX
+            // HIP-3: from direct HL fetch
             if price == nil, let hip3 = hip3Prices[m.symbol] ?? hip3Prices[m.name], hip3 > 0 {
                 price = hip3
             }
 
-            // XYZ debug: log lookup result for HIP-3 markets
+            // Debug: log HIP-3 lookup
             if m.symbol.contains(":") {
-                print("[XYZ WIDGET LOOKUP KEY] symbol=\(m.symbol) name=\(m.name) → mids[\(m.symbol)]=\(mids[m.symbol] ?? "nil") hip3[\(m.symbol)]=\(hip3Prices[m.symbol].map { String($0) } ?? "nil") hip3[\(m.name)]=\(hip3Prices[m.name].map { String($0) } ?? "nil") → finalPrice=\(price.map { String($0) } ?? "nil")")
+                let found = hip3Prices[m.symbol] ?? hip3Prices[m.name]
+                print("[HIP3 LOOKUP] symbol=\(m.symbol) name=\(m.name) → hip3Price=\(found.map { String($0) } ?? "MISS") finalPrice=\(price.map { String($0) } ?? "nil")")
             }
 
             if let price, price > 0 {
@@ -826,7 +841,7 @@ private enum SharedMarketReader {
     /// Fetch allMids from Hyperliquid (main DEX perps + spot pairs)
     private static func fetchAllMids() async -> [String: String] {
         guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return [:] }
-        var request = URLRequest(url: url, timeoutInterval: 10)
+        var request = URLRequest(url: url, timeoutInterval: 6)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["type": "allMids"])
@@ -839,21 +854,65 @@ private enum SharedMarketReader {
         }
     }
 
-    /// Fetch HIP-3 prices from our backend /all-prices
-    /// If that fails, fetch each HIP-3 DEX from HL in parallel (not sequentially).
-    /// - Parameters:
-    ///   - fresh: When true, appends ?fresh=1 to bypass backend cache.
-    ///   - neededDexes: When non-empty, tells the backend to only refresh these DEXes (saves API calls).
-    private static func fetchHIP3Prices(fresh: Bool = false, neededDexes: Set<String> = []) async -> [String: Double] {
-        // Try 1: Our backend (has all HIP-3 cached)
-        var suffix = fresh ? "?fresh=1" : ""
-        if fresh && !neededDexes.isEmpty {
-            suffix += "&dexes=\(neededDexes.sorted().joined(separator: ","))"
+    // MARK: - HIP-3 prices
+
+    /// Fetch HIP-3 prices directly from Hyperliquid API for specific DEXes — in parallel.
+    /// Used by widget refresh (fresh=true) for speed and reliability (no backend dependency).
+    private static func fetchHIP3Direct(dexes: Set<String>) async -> [String: Double] {
+        let dexList = dexes.isEmpty ? ["xyz", "cash", "km"] : Array(dexes)
+        let t0 = CFAbsoluteTimeGetCurrent()
+        print("[HIP3 DIRECT START] fetching \(dexList.count) DEXes: \(dexList)")
+
+        var combined: [String: Double] = [:]
+        await withTaskGroup(of: (String, [String: Double]).self) { group in
+            for dex in dexList {
+                group.addTask {
+                    guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return (dex, [:]) }
+                    var request = URLRequest(url: url, timeoutInterval: 6)
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+                        "type": "metaAndAssetCtxs",
+                        "dex": dex
+                    ])
+                    guard let (data, _) = try? await URLSession.shared.data(for: request),
+                          let arr = try? JSONSerialization.jsonObject(with: data) as? [Any],
+                          arr.count >= 2,
+                          let meta = (arr[0] as? [String: Any])?["universe"] as? [[String: Any]],
+                          let ctxs = arr[1] as? [[String: Any]] else {
+                        print("[HIP3 DIRECT FAIL] dex=\(dex) — bad response")
+                        return (dex, [:])
+                    }
+                    var prices: [String: Double] = [:]
+                    for (i, asset) in meta.enumerated() where i < ctxs.count {
+                        if let rawName = asset["name"] as? String,
+                           let markPx = ctxs[i]["markPx"] as? String,
+                           let price = Double(markPx), price > 0 {
+                            // Normalize: HL API may return unprefixed names for some DEXes.
+                            // Must prefix with "dex:" to match widget symbol keys (e.g. "xyz:WTIOIL").
+                            let name = rawName.contains(":") ? rawName : "\(dex):\(rawName)"
+                            prices[name] = price
+                        }
+                    }
+                    print("[HIP3 DIRECT OK] dex=\(dex) — \(prices.count) prices (raw first: \(meta.first?["name"] as? String ?? "?") → normalized: \(prices.keys.first ?? "?"))")
+                    return (dex, prices)
+                }
+            }
+            for await (_, prices) in group {
+                combined.merge(prices) { _, new in new }
+            }
         }
-        if let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/all-prices\(suffix)") {
-            print("[XYZ REFRESH URL] \(url.absoluteString)")
-            var request = URLRequest(url: url, timeoutInterval: 12)
-            if fresh { request.cachePolicy = .reloadIgnoringLocalCacheData }
+
+        let t1 = CFAbsoluteTimeGetCurrent()
+        print("[HIP3 DIRECT DONE] \(String(format: "%.0f", (t1 - t0) * 1000))ms — \(combined.count) total prices")
+        return combined
+    }
+
+    /// Fetch HIP-3 prices from backend cache (used for non-fresh timeline updates).
+    /// Falls back to direct HL fetch if backend fails.
+    private static func fetchHIP3FromBackend(dexes: Set<String>) async -> [String: Double] {
+        if let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/all-prices") {
+            var request = URLRequest(url: url, timeoutInterval: 8)
             if let (data, resp) = try? await URLSession.shared.data(for: request),
                let http = resp as? HTTPURLResponse, http.statusCode == 200,
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -867,45 +926,8 @@ private enum SharedMarketReader {
                 if !result.isEmpty { return result }
             }
         }
-
-        // Try 2: Fetch directly from HL for needed DEXes (or fallback to common ones) — in parallel.
-        let dexes = neededDexes.isEmpty ? ["xyz", "cash", "km"] : Array(neededDexes)
-        var combined: [String: Double] = [:]
-        await withTaskGroup(of: [String: Double].self) { group in
-            for dex in dexes {
-                group.addTask {
-                    guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return [:] }
-                    var request = URLRequest(url: url, timeoutInterval: 8)
-                    request.httpMethod = "POST"
-                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    request.httpBody = try? JSONSerialization.data(withJSONObject: [
-                        "type": "metaAndAssetCtxs",
-                        "dex": dex
-                    ])
-                    guard let (data, _) = try? await URLSession.shared.data(for: request),
-                          let arr = try? JSONSerialization.jsonObject(with: data) as? [Any],
-                          arr.count >= 2,
-                          let meta = (arr[0] as? [String: Any])?["universe"] as? [[String: Any]],
-                          let ctxs = arr[1] as? [[String: Any]] else { return [:] }
-                    var prices: [String: Double] = [:]
-                    for (i, asset) in meta.enumerated() where i < ctxs.count {
-                        if let rawName = asset["name"] as? String,
-                           let markPx = ctxs[i]["markPx"] as? String,
-                           let price = Double(markPx), price > 0 {
-                            // Normalize: HL API may return unprefixed names for some DEXes.
-                            // Must prefix with "dex:" to match widget symbol keys (e.g. "xyz:WTIOIL").
-                            let name = rawName.contains(":") ? rawName : "\(dex):\(rawName)"
-                            prices[name] = price
-                        }
-                    }
-                    return prices
-                }
-            }
-            for await prices in group {
-                combined.merge(prices) { _, new in new }
-            }
-        }
-        return combined
+        // Backend failed — fetch directly from HL
+        return await fetchHIP3Direct(dexes: dexes)
     }
 
     /// Fetch daily opens directly from backend when App Group is empty.
@@ -954,6 +976,9 @@ struct RefreshMarketsIntent: AppIntent {
     static var title: LocalizedStringResource = "Refresh Markets"
 
     func perform() async throws -> some IntentResult {
+        let tStart = CFAbsoluteTimeGetCurrent()
+        print("[WIDGET REFRESH TAPPED] \(Date())")
+
         guard let defaults = UserDefaults(suiteName: "group.com.Hyperview.Hyperview"),
               var arr = defaults.array(forKey: "widget_shared_markets") as? [[String: Any]]
         else {
@@ -962,8 +987,6 @@ struct RefreshMarketsIntent: AppIntent {
         }
 
         // Build a lightweight market list (no icons needed — we only want fresh prices).
-        // Do NOT call loadFromApp() here: it fetches icons for all markets, which is
-        // unnecessary for a price-only refresh and adds 500ms–3s of latency.
         let markets = arr.compactMap { dict -> WidgetMarket? in
             guard let name = dict["n"] as? String,
                   let price = dict["p"] as? Double,
@@ -971,40 +994,49 @@ struct RefreshMarketsIntent: AppIntent {
                   let volume = dict["v"] as? Double else { return nil }
             let symbol = dict["s"] as? String ?? name
             let iconName = dict["icon"] as? String ?? name
-            // XYZ debug: log raw stored data for HIP-3 markets
-            if symbol.contains(":") {
-                print("[XYZ WIDGET RAW SYMBOL] name(n)=\(name) symbol(s)=\(symbol) price=\(price)")
-            }
             return WidgetMarket(name: name, symbol: symbol, price: price, change24h: change,
                                 volume24h: volume, iconData: nil, iconName: iconName)
         }
 
-        // Fetch HL prices + custom chart prices in parallel — fresh=true bypasses backend cache
+        let hip3Symbols = markets.filter { $0.symbol.contains(":") }.map { "[\($0.symbol) n=\($0.name)]" }
+        let normalSymbols = markets.filter { !$0.symbol.contains(":") }.map(\.symbol)
+        print("[WIDGET MARKETS] \(markets.count) total — normal: \(normalSymbols) hip3: \(hip3Symbols)")
+
+        // Fetch HL prices + custom chart prices ALL in parallel — NO backend dependency for fresh
         let customCharts = SharedMarketReader.loadCustomCharts()
+        let tFetch = CFAbsoluteTimeGetCurrent()
         async let hlTask = SharedMarketReader.fetchAllMidsFallback(markets: markets, fresh: true)
         async let customTask = SharedMarketReader.fetchCustomChartPrices(customCharts)
 
         let freshPrices = await hlTask
         let customPrices = await customTask
+        let tFetched = CFAbsoluteTimeGetCurrent()
+        print("[RESPONSE RECEIVED] \(String(format: "%.0f", (tFetched - tFetch) * 1000))ms — \(freshPrices.count) prices")
 
         if !freshPrices.isEmpty {
+            var normalUpdated = 0, hip3Updated = 0, hip3Missed = 0
             for i in arr.indices {
                 if let name = arr[i]["n"] as? String, let fresh = freshPrices[name] {
                     let sym = arr[i]["s"] as? String ?? ""
                     if sym.contains(":") {
                         let oldPrice = arr[i]["p"] as? Double ?? 0
-                        print("[XYZ FINAL WRITTEN PRICE] name=\(name) symbol=\(sym) old=\(oldPrice) → new=\(fresh.price)")
+                        print("[HIP3 FINAL WRITTEN] \(sym) old=\(oldPrice) → new=\(fresh.price)")
+                        hip3Updated += 1
+                    } else {
+                        normalUpdated += 1
                     }
                     arr[i]["p"] = fresh.price
                     arr[i]["c"] = fresh.change
                     arr[i]["v"] = fresh.volume
                 } else if let name = arr[i]["n"] as? String, let sym = arr[i]["s"] as? String, sym.contains(":") {
-                    print("[XYZ FINAL WRITTEN PRICE] MISS — name=\(name) symbol=\(sym) not found in freshPrices (keys: \(freshPrices.keys.filter { $0.contains(":") }.sorted().joined(separator: ", ")))")
+                    print("[HIP3 FINAL MISS] name=\(name) symbol=\(sym) — freshPrices has \(freshPrices.keys.filter { $0.contains(":") }.count) HIP-3 keys")
+                    hip3Missed += 1
                 }
             }
             defaults.set(arr, forKey: "widget_shared_markets")
-            // Stamp the update time so getTimeline can skip the redundant price re-fetch.
             defaults.set(Date().timeIntervalSince1970, forKey: "widget_last_update")
+            let tWritten = CFAbsoluteTimeGetCurrent()
+            print("[FINAL WRITEBACK] \(String(format: "%.0f", (tWritten - tStart) * 1000))ms total — normal=\(normalUpdated) hip3=\(hip3Updated) hip3missed=\(hip3Missed)")
         }
 
         // Update custom charts with fresh Binance prices
@@ -1020,7 +1052,10 @@ struct RefreshMarketsIntent: AppIntent {
             }
             defaults.set(customArr, forKey: "widget_custom_charts")
         }
+
         WidgetCenter.shared.reloadTimelines(ofKind: "MarketWidget")
+        let tEnd = CFAbsoluteTimeGetCurrent()
+        print("[TIMELINE RELOAD] \(String(format: "%.0f", (tEnd - tStart) * 1000))ms total end-to-end")
         return .result()
     }
 }
