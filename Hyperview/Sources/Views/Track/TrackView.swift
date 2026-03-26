@@ -122,8 +122,6 @@ struct TrackView: View {
         .task { await loadAliases() }
         .sheet(isPresented: $showMarketPicker) {
             MarketPickerSheet(
-                markets: marketsVM.markets
-                    .filter { $0.marketType == .perp && !$0.isPreLaunch },
                 selection: $selectedMarket,
                 outcomeSelection: $selectedOutcome,
                 isPresented: $showMarketPicker

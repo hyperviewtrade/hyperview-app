@@ -932,8 +932,9 @@ private enum SharedMarketReader {
 
     /// Fetch HIP-3 prices from backend cache (used for non-fresh timeline updates).
     /// Falls back to direct HL fetch if backend fails.
+    /// Uses ?fields=prices to skip daily opens (not needed here) — ~50% smaller payload.
     private static func fetchHIP3FromBackend(dexes: Set<String>) async -> [String: Double] {
-        if let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/all-prices") {
+        if let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/all-prices?fields=prices") {
             var request = URLRequest(url: url, timeoutInterval: 8)
             if let (data, resp) = try? await URLSession.shared.data(for: request),
                let http = resp as? HTTPURLResponse, http.statusCode == 200,

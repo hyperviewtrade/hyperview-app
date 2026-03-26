@@ -15,19 +15,26 @@ struct TrackSearchResultsView: View {
 
     enum SideFilterOption { case long, short }
 
-    @StateObject private var vm = TrackSearchViewModel()
+    // Separate VM per tab so switching is instant (no refetch)
+    @StateObject private var notLarpsVM = TrackSearchViewModel()
+    @StateObject private var larpsVM    = TrackSearchViewModel()
+
     @EnvironmentObject var chartVM: ChartViewModel
 
     @State private var walletToShow: WalletIdentifier?
-    @State private var displayFilter: DisplayFilter = .all
+    @State private var displayFilter: DisplayFilter = .notLarps
     @State private var aliases: [String: String] = [:]
     @State private var positionToShare: TrackedPosition? = nil
     @State private var positionToCopy: TrackedPosition? = nil
 
     enum DisplayFilter: String, CaseIterable {
-        case larps    = "LARPS"
         case notLarps = "NOT LARPS"
-        case all      = "ALL"
+        case larps    = "LARPS"
+    }
+
+    /// The active VM for the currently selected tab.
+    private var vm: TrackSearchViewModel {
+        displayFilter == .notLarps ? notLarpsVM : larpsVM
     }
 
     var body: some View {
@@ -38,9 +45,7 @@ struct TrackSearchResultsView: View {
             Divider().background(Color.hlSurface)
 
             // ── Display filter ───────────────────────────
-            if !vm.results.isEmpty {
-                displayFilterBar
-            }
+            displayFilterBar
 
             // Content
             if vm.isLoading && vm.results.isEmpty {
@@ -64,16 +69,9 @@ struct TrackSearchResultsView: View {
         }
         .task {
             await loadAliases()
-            // Only search on first load — keep results cached when returning from wallet detail
-            guard vm.results.isEmpty else { return }
-            await vm.search(
-                coin: market.apiCoin,
-                side: sideFilter == .long ? .long : sideFilter == .short ? .short : nil,
-                minAmount: minAmount,
-                maxAmount: maxAmount,
-                minEntry: minEntry,
-                maxEntry: maxEntry
-            )
+            // Only fetch the default tab on first appear
+            guard notLarpsVM.results.isEmpty else { return }
+            await performSearch(for: .notLarps, reset: true)
         }
         .navigationDestination(isPresented: Binding(
             get: { walletToShow != nil },
@@ -88,6 +86,39 @@ struct TrackSearchResultsView: View {
         }
     }
 
+    // MARK: - Search dispatch
+
+    /// Builds the correct notional filter for the given tab and calls its VM.
+    private func performSearch(for filter: DisplayFilter, reset: Bool) async {
+        let targetVM = filter == .notLarps ? notLarpsVM : larpsVM
+        let (minN, maxN) = notionalBoundsForFilter(filter)
+        await targetVM.search(
+            coin: market.apiCoin,
+            side: sideFilter == .long ? .long : sideFilter == .short ? .short : nil,
+            minAmount: minN ?? minAmount,
+            maxAmount: maxN ?? maxAmount,
+            minEntry: minEntry,
+            maxEntry: maxEntry,
+            reset: reset
+        )
+    }
+
+    /// Returns (minNotional, maxNotional) overrides based on the given display filter.
+    /// "NOT LARPS" -> minNotional = $1,000 (server only returns >= $1K)
+    /// "LARPS"     -> maxNotional = $999.99 (server only returns < $1K)
+    private func notionalBoundsForFilter(_ filter: DisplayFilter) -> (Double?, Double?) {
+        switch filter {
+        case .notLarps:
+            // Merge with user-specified minAmount (take the larger)
+            let min = max(minAmount ?? 0, kLarpThreshold)
+            return (min, maxAmount)
+        case .larps:
+            // Merge with user-specified maxAmount (take the smaller)
+            let max = min(maxAmount ?? kLarpThreshold - 0.01, kLarpThreshold - 0.01)
+            return (minAmount, max)
+        }
+    }
+
     // MARK: - Header
 
     private var headerBar: some View {
@@ -96,9 +127,16 @@ struct TrackSearchResultsView: View {
                 Text("\(market.displayName)-PERP")
                     .font(.system(size: 16, weight: .bold))
                     .foregroundColor(.white)
-                Text("\(vm.results.count) results")
-                    .font(.system(size: 12))
-                    .foregroundColor(Color(white: 0.5))
+
+                if vm.totalCount > 0 {
+                    Text("\(vm.totalCount) / \(vm.totalCountAll)")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(white: 0.5))
+                } else if !vm.results.isEmpty {
+                    Text("\(vm.results.count) results")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(white: 0.5))
+                }
             }
 
             // Active filters
@@ -106,13 +144,15 @@ struct TrackSearchResultsView: View {
                 if let side = sideFilter {
                     filterTag(side == .long ? "Long" : "Short")
                 }
-                if let mn = minAmount { filterTag("Size ≥ \(formatFull(mn))") }
-                if let mx = maxAmount { filterTag("Size ≤ \(formatFull(mx))") }
-                if let mn = minEntry  { filterTag("Entry ≥ \(formatFull(mn))") }
-                if let mx = maxEntry  { filterTag("Entry ≤ \(formatFull(mx))") }
+                if let mn = minAmount, mn >= kLarpThreshold || displayFilter == .larps {
+                    filterTag("Size >= \(formatFull(mn))")
+                }
+                if let mx = maxAmount { filterTag("Size <= \(formatFull(mx))") }
+                if let mn = minEntry  { filterTag("Entry >= \(formatFull(mn))") }
+                if let mx = maxEntry  { filterTag("Entry <= \(formatFull(mx))") }
             }
 
-            if !vm.progress.isEmpty {
+            if !vm.progress.isEmpty && vm.isLoading {
                 Text(vm.progress)
                     .font(.system(size: 11))
                     .foregroundColor(Color(white: 0.5))
@@ -133,25 +173,19 @@ struct TrackSearchResultsView: View {
             .cornerRadius(6)
     }
 
-    // MARK: - Computed splits
-
-    private var larps: [TrackedPosition] {
-        vm.results.filter { $0.notionalUSD < 1_000 }.sorted { $0.notionalUSD > $1.notionalUSD }
-    }
-
-    private var otherPositions: [TrackedPosition] {
-        vm.results.filter { $0.notionalUSD >= 1_000 }.sorted { $0.notionalUSD > $1.notionalUSD }
-    }
-
-    // MARK: - Results list
-
     // MARK: - Display filter bar
 
     private var displayFilterBar: some View {
         HStack(spacing: 6) {
             ForEach(DisplayFilter.allCases, id: \.self) { filter in
                 Button {
+                    guard displayFilter != filter else { return }
                     withAnimation(.easeInOut(duration: 0.15)) { displayFilter = filter }
+                    // Lazy-load: only fetch if this tab has no cached results yet
+                    let targetVM = filter == .notLarps ? notLarpsVM : larpsVM
+                    if targetVM.results.isEmpty {
+                        Task { await performSearch(for: filter, reset: true) }
+                    }
                 } label: {
                     Text(filter.rawValue)
                         .font(.system(size: 11, weight: .semibold))
@@ -169,86 +203,89 @@ struct TrackSearchResultsView: View {
         .background(Color.hlCardBackground)
     }
 
+    // MARK: - Results list
+
     private var resultsList: some View {
         List {
-            // ── LARPS section ────────────────────────────
-            if !larps.isEmpty && displayFilter != .notLarps {
-                Section {
-                    ForEach(larps) { pos in
-                        Button {
-                            walletToShow = WalletIdentifier(address: pos.address)
-                        } label: {
-                            positionRow(pos)
-                        }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button {
-                                copyTrade(pos)
-                            } label: {
-                                Label("CopyTrade", systemImage: "doc.on.doc")
-                            }
-                            .tint(.hlGreen)
-
-                            Button {
-                                positionToShare = pos
-                            } label: {
-                                Label("Share", systemImage: "square.and.arrow.up")
-                            }
-                            .tint(.blue)
-                        }
-                        .listRowBackground(Color(white: 0.11))
-                        .listRowSeparatorTint(Color(white: 0.18))
+            Section {
+                ForEach(vm.results) { pos in
+                    Button {
+                        walletToShow = WalletIdentifier(address: pos.address)
+                    } label: {
+                        positionRow(pos)
                     }
-                } header: {
-                    Text(larps.count == 1
-                         ? "LARP DETECTED ❗️"
-                         : "LARPS DETECTED ❗️")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundColor(.white)
-                        .textCase(nil)
-                        .listRowInsets(EdgeInsets(top: 12, leading: 0, bottom: 8, trailing: 0))
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button {
+                            copyTrade(pos)
+                        } label: {
+                            Label("CopyTrade", systemImage: "doc.on.doc")
+                        }
+                        .tint(.hlGreen)
+
+                        Button {
+                            positionToShare = pos
+                        } label: {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                        }
+                        .tint(.blue)
+                    }
+                    .listRowBackground(Color(white: 0.11))
+                    .listRowSeparatorTint(Color(white: 0.18))
                 }
+            } header: {
+                Text(sectionHeader)
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(.white)
+                    .textCase(nil)
+                    .listRowInsets(EdgeInsets(top: 12, leading: 0, bottom: 8, trailing: 0))
             }
 
-            // ── Other positions section ──────────────────
-            if !otherPositions.isEmpty && displayFilter != .larps {
+            // ── Load-more sentinel ──────────────────────────
+            // This is a single row at the very bottom of the list.
+            // It only fires .onAppear when the user actually scrolls to it,
+            // NOT when SwiftUI pre-renders rows above it.
+            if vm.hasMore {
                 Section {
-                    ForEach(otherPositions) { pos in
-                        Button {
-                            walletToShow = WalletIdentifier(address: pos.address)
-                        } label: {
-                            positionRow(pos)
-                        }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button {
-                                copyTrade(pos)
-                            } label: {
-                                Label("CopyTrade", systemImage: "doc.on.doc")
-                            }
-                            .tint(.hlGreen)
-
-                            Button {
-                                positionToShare = pos
-                            } label: {
-                                Label("Share", systemImage: "square.and.arrow.up")
-                            }
-                            .tint(.blue)
+                    if vm.isLoadingMore {
+                        HStack {
+                            Spacer()
+                            ProgressView().tint(.white)
+                            Text("Loading more\u{2026}")
+                                .font(.system(size: 12))
+                                .foregroundColor(Color(white: 0.4))
+                            Spacer()
                         }
                         .listRowBackground(Color(white: 0.11))
-                        .listRowSeparatorTint(Color(white: 0.18))
+                    } else {
+                        // Explicit "Load More" button — prevents auto-cascade
+                        Button {
+                            Task { await performSearch(for: displayFilter, reset: false) }
+                        } label: {
+                            HStack {
+                                Spacer()
+                                Text("Load More (\(vm.results.count) of \(vm.totalCount))")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundColor(.hlGreen)
+                                Spacer()
+                            }
+                            .padding(.vertical, 8)
+                        }
+                        .listRowBackground(Color(white: 0.11))
                     }
-                } header: {
-                    Text(otherPositions.count == 1
-                         ? "NOT LARP :"
-                         : "NOT LARPS :")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundColor(.white)
-                        .textCase(nil)
-                        .listRowInsets(EdgeInsets(top: 12, leading: 0, bottom: 8, trailing: 0))
                 }
             }
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
+    }
+
+    private var sectionHeader: String {
+        switch displayFilter {
+        case .larps:
+            return vm.results.count == 1 ? "LARP DETECTED" : "LARPS DETECTED"
+        case .notLarps:
+            return vm.results.count == 1 ? "NOT LARP :" : "NOT LARPS :"
+        }
     }
 
     private func positionRow(_ pos: TrackedPosition) -> some View {
@@ -268,7 +305,7 @@ struct TrackSearchResultsView: View {
 
                 DirectionBadge(isLong: pos.isLong)
 
-                Text("\(pos.leverage)×")
+                Text("\(pos.leverage)\u{00D7}")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Color(white: 0.5))
 
@@ -336,14 +373,7 @@ struct TrackSearchResultsView: View {
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
             Button("Retry") {
-                Task {
-                    await vm.search(
-                        coin: market.apiCoin,
-                        side: sideFilter == .long ? .long : sideFilter == .short ? .short : nil,
-                        minAmount: minAmount, maxAmount: maxAmount,
-                        minEntry: minEntry, maxEntry: maxEntry
-                    )
-                }
+                Task { await performSearch(for: displayFilter, reset: true) }
             }
             .buttonStyle(.bordered).tint(.hlGreen)
         }

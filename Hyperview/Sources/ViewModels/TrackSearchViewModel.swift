@@ -82,15 +82,26 @@ struct TrackedPosition: Identifiable {
 
 enum PositionSide { case long, short }
 
+/// LARP threshold — positions below this notional are considered LARPs.
+let kLarpThreshold: Double = 1_000
+
 @MainActor
 final class TrackSearchViewModel: ObservableObject {
     @Published var results: [TrackedPosition] = []
-    @Published var isLoading = true   // Start as loading — first render shows hourglass, not "No positions"
+    @Published var isLoading = true
+    @Published var isLoadingMore = false
     @Published var progress  = "Searching…"
     @Published var errorMsg: String?
+    @Published var totalCount = 0
+    @Published var totalCountAll = 0   // total positions for coin (unfiltered)
+    @Published var hasMore = false
 
-    // TODO: Update this URL after deploying the backend
+    private var currentOffset = 0
+    private static let pageSize = 100
+
     private static let backendBaseURL = "https://hyperview-backend-production-075c.up.railway.app"
+
+    // ─── Primary search with pagination ──────────────────────────────
 
     func search(
         coin: String,
@@ -98,15 +109,20 @@ final class TrackSearchViewModel: ObservableObject {
         minAmount: Double?,
         maxAmount: Double?,
         minEntry: Double?,
-        maxEntry: Double?
+        maxEntry: Double?,
+        reset: Bool = true
     ) async {
-        isLoading = true
-        errorMsg  = nil
-        results   = []
-        progress  = "Searching…"
+        if reset {
+            isLoading = true
+            errorMsg  = nil
+            results   = []
+            progress  = "Searching…"
+            currentOffset = 0
+        } else {
+            isLoadingMore = true
+        }
 
         do {
-            // Build URL with query params
             var components = URLComponents(string: "\(Self.backendBaseURL)/search")!
             var queryItems: [URLQueryItem] = [
                 URLQueryItem(name: "coin", value: coin)
@@ -128,10 +144,15 @@ final class TrackSearchViewModel: ObservableObject {
                 queryItems.append(URLQueryItem(name: "maxNotional", value: String(mx)))
             }
 
+            // Pagination
+            queryItems.append(URLQueryItem(name: "limit", value: String(Self.pageSize)))
+            queryItems.append(URLQueryItem(name: "offset", value: String(currentOffset)))
+
             components.queryItems = queryItems
             guard let url = components.url else {
                 errorMsg = "Invalid URL"
                 isLoading = false
+                isLoadingMore = false
                 return
             }
 
@@ -145,22 +166,20 @@ final class TrackSearchViewModel: ObservableObject {
                 print("🔍 [LARP] HTTP error: \(code)")
                 errorMsg = "Server error"
                 isLoading = false
+                isLoadingMore = false
                 return
             }
-
-            let rawString = String(data: data.prefix(500), encoding: .utf8) ?? "?"
-            print("🔍 [LARP] Response (\(data.count) bytes): \(rawString)")
 
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let positions = json["positions"] as? [[String: Any]] else {
                 print("🔍 [LARP] JSON parse failed")
                 errorMsg = "Invalid response"
                 isLoading = false
+                isLoadingMore = false
                 return
             }
-            print("🔍 [LARP] Parsed \(positions.count) positions")
 
-            results = positions.compactMap { pos in
+            let newPositions = positions.compactMap { pos -> TrackedPosition? in
                 guard let address = pos["address"] as? String,
                       let coin = pos["coin"] as? String,
                       let size = pos["size"] as? Double,
@@ -185,25 +204,46 @@ final class TrackSearchViewModel: ObservableObject {
                 )
             }
 
-            progress = "\(results.count) positions found"
+            totalCount = (json["totalCount"] as? Int) ?? newPositions.count
+            totalCountAll = (json["totalCountAll"] as? Int) ?? totalCount
+            hasMore = (json["hasMore"] as? Bool) ?? false
+            currentOffset += newPositions.count
+
+            if reset {
+                results = newPositions
+            } else {
+                results.append(contentsOf: newPositions)
+            }
+
+            progress = "\(results.count) of \(totalCount) positions"
 
         } catch {
             errorMsg = error.localizedDescription
         }
         isLoading = false
+        isLoadingMore = false
     }
 
-    /// Entry-price specific search (larp detection)
+    // ─── Entry-price specific search (larp detection) ────────────────
+
     func searchByEntry(
         coin: String,
         targetPrice: Double,
         range: Double = 0.05,
-        side: PositionSide? = nil
+        side: PositionSide? = nil,
+        minNotional: Double? = nil,
+        maxNotional: Double? = nil,
+        reset: Bool = true
     ) async {
-        isLoading = true
-        errorMsg  = nil
-        results   = []
-        progress  = "Searching…"
+        if reset {
+            isLoading = true
+            errorMsg  = nil
+            results   = []
+            progress  = "Searching…"
+            currentOffset = 0
+        } else {
+            isLoadingMore = true
+        }
 
         do {
             var components = URLComponents(string: "\(Self.backendBaseURL)/search-entry")!
@@ -215,11 +255,23 @@ final class TrackSearchViewModel: ObservableObject {
             if let s = side {
                 queryItems.append(URLQueryItem(name: "side", value: s == .long ? "long" : "short"))
             }
+            if let mn = minNotional {
+                queryItems.append(URLQueryItem(name: "minNotional", value: String(mn)))
+            }
+            if let mx = maxNotional {
+                queryItems.append(URLQueryItem(name: "maxNotional", value: String(mx)))
+            }
+
+            // Pagination
+            queryItems.append(URLQueryItem(name: "limit", value: String(Self.pageSize)))
+            queryItems.append(URLQueryItem(name: "offset", value: String(currentOffset)))
+
             components.queryItems = queryItems
 
             guard let url = components.url else {
                 errorMsg = "Invalid URL"
                 isLoading = false
+                isLoadingMore = false
                 return
             }
 
@@ -229,6 +281,7 @@ final class TrackSearchViewModel: ObservableObject {
                   httpResponse.statusCode == 200 else {
                 errorMsg = "Server error"
                 isLoading = false
+                isLoadingMore = false
                 return
             }
 
@@ -236,10 +289,11 @@ final class TrackSearchViewModel: ObservableObject {
                   let positions = json["positions"] as? [[String: Any]] else {
                 errorMsg = "Invalid response"
                 isLoading = false
+                isLoadingMore = false
                 return
             }
 
-            results = positions.compactMap { pos in
+            let newPositions = positions.compactMap { pos -> TrackedPosition? in
                 guard let address = pos["address"] as? String,
                       let coin = pos["coin"] as? String,
                       let size = pos["size"] as? Double,
@@ -264,11 +318,23 @@ final class TrackSearchViewModel: ObservableObject {
                 )
             }
 
-            progress = "\(results.count) positions found"
+            totalCount = (json["totalCount"] as? Int) ?? newPositions.count
+            totalCountAll = (json["totalCountAll"] as? Int) ?? totalCount
+            hasMore = (json["hasMore"] as? Bool) ?? false
+            currentOffset += newPositions.count
+
+            if reset {
+                results = newPositions
+            } else {
+                results.append(contentsOf: newPositions)
+            }
+
+            progress = "\(results.count) of \(totalCount) positions"
 
         } catch {
             errorMsg = error.localizedDescription
         }
         isLoading = false
+        isLoadingMore = false
     }
 }

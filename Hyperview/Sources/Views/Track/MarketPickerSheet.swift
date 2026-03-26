@@ -1,7 +1,6 @@
 import SwiftUI
 
 struct MarketPickerSheet: View {
-    let markets: [Market]
     @Binding var selection: Market?
     @Binding var outcomeSelection: OutcomeQuestion?
     @Binding var isPresented: Bool
@@ -19,8 +18,13 @@ struct MarketPickerSheet: View {
 
     // MARK: - Filtered lists
 
+    /// Reactive: reads marketsVM.markets every render, so new data appears automatically.
+    private var perpMarkets: [Market] {
+        marketsVM.markets.filter { $0.marketType == .perp && !$0.isPreLaunch }
+    }
+
     private var filteredCrypto: [Market] {
-        let sorted = markets.sorted { ($0.openInterest * $0.price) > ($1.openInterest * $1.price) }
+        let sorted = perpMarkets.sorted { ($0.openInterest * $0.price) > ($1.openInterest * $1.price) }
         if search.isEmpty { return sorted }
         let q = search.lowercased()
         return sorted.filter { $0.displayName.lowercased().contains(q) }
@@ -107,51 +111,63 @@ struct MarketPickerSheet: View {
     // MARK: - Crypto list
 
     private var cryptoList: some View {
-        List(filteredCrypto, id: \.symbol) { market in
-            Button {
-                selection = market
-                outcomeSelection = nil
-                isPresented = false
-            } label: {
-                HStack(spacing: 12) {
-                    CoinIconView(
-                        symbol: market.displaySymbol,
-                        hlIconName: market.hlCoinIconName,
-                        iconSize: 28
-                    )
+        Group {
+            if filteredCrypto.isEmpty && marketsVM.isLoading {
+                VStack(spacing: 12) {
+                    ProgressView().tint(.white)
+                    Text("Loading markets…")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(white: 0.4))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(filteredCrypto, id: \.symbol) { market in
+                    Button {
+                        selection = market
+                        outcomeSelection = nil
+                        isPresented = false
+                    } label: {
+                        HStack(spacing: 12) {
+                            CoinIconView(
+                                symbol: market.displaySymbol,
+                                hlIconName: market.hlCoinIconName,
+                                iconSize: 28
+                            )
 
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(market.displayName)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(.white)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(market.displayName)
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundColor(.white)
 
-                        HStack(spacing: 8) {
-                            if market.openInterest > 0 {
-                                Text("OI $\(market.formattedOI)")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(Color(white: 0.4))
+                                HStack(spacing: 8) {
+                                    if market.openInterest > 0 {
+                                        Text("OI $\(market.formattedOI)")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(Color(white: 0.4))
+                                    }
+                                    if market.volume24h > 0 {
+                                        Text("Vol $\(market.formattedVolume)")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(Color(white: 0.4))
+                                    }
+                                }
                             }
-                            if market.volume24h > 0 {
-                                Text("Vol $\(market.formattedVolume)")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(Color(white: 0.4))
+
+                            Spacer()
+
+                            if selection?.symbol == market.symbol && outcomeSelection == nil {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.hlGreen)
+                                    .font(.system(size: 14, weight: .semibold))
                             }
                         }
                     }
-
-                    Spacer()
-
-                    if selection?.symbol == market.symbol && outcomeSelection == nil {
-                        Image(systemName: "checkmark")
-                            .foregroundColor(.hlGreen)
-                            .font(.system(size: 14, weight: .semibold))
-                    }
+                    .listRowBackground(Color.hlCardBackground)
+                    .listRowSeparatorTint(Color.hlDivider)
                 }
+                .listStyle(.plain)
             }
-            .listRowBackground(Color.hlCardBackground)
-            .listRowSeparatorTint(Color.hlDivider)
         }
-        .listStyle(.plain)
     }
 
     // MARK: - Outcome list
