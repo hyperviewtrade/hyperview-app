@@ -58,11 +58,20 @@ actor ExchangeSymbolIndex {
     }
 
     /// Search symbols — returns results matching the query, limited to `limit`.
+    /// Results are interleaved by exchange within each score tier for diversity.
     func search(query: String, limit: Int = 40) async -> [IndexedSymbol] {
         if !isLoaded { await loadIndex() }
 
         let q = query.uppercased().trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return [] }
+
+        // --- Temporary AVAX debug ---
+        let isAvaxQuery = q.contains("AVAX")
+        if isAvaxQuery {
+            print("SEARCH QUERY NORMALIZED: \"\(q)\"")
+            let inIndex = symbols.filter { $0.symbol.uppercased().contains("AVAX") || $0.baseAsset.uppercased() == "AVAX" }
+            print("INDEXED AVAX AT SEARCH TIME: \(inIndex.count) entries → \(inIndex.map { "\($0.exchange):\($0.symbol)" })")
+        }
 
         // Score and rank results
         var scored: [(symbol: IndexedSymbol, score: Int)] = []
@@ -74,8 +83,56 @@ actor ExchangeSymbolIndex {
             }
         }
 
+        // --- Temporary AVAX debug ---
+        if isAvaxQuery {
+            let avaxCandidates = scored.filter { $0.symbol.symbol.uppercased().contains("AVAX") || $0.symbol.baseAsset.uppercased() == "AVAX" }
+            print("SEARCH CANDIDATES FOR AVAX: \(avaxCandidates.count) → \(avaxCandidates.map { "(\($0.symbol.exchange):\($0.symbol.symbol) score=\($0.score))" })")
+        }
+
         scored.sort { $0.score > $1.score }
-        return Array(scored.prefix(limit).map(\.symbol))
+
+        // Within each score tier, interleave exchanges (round-robin) so results
+        // spread across exchanges instead of showing 15 Binance entries first.
+        var result: [IndexedSymbol] = []
+        var i = 0
+        while i < scored.count && result.count < limit {
+            let tier = scored[i].score
+            // Collect all entries with the same score
+            var tierEntries: [IndexedSymbol] = []
+            while i < scored.count && scored[i].score == tier {
+                tierEntries.append(scored[i].symbol)
+                i += 1
+            }
+            // Round-robin by exchange within tier
+            var byExchange: [String: [IndexedSymbol]] = [:]
+            var exchangeOrder: [String] = []
+            for entry in tierEntries {
+                if byExchange[entry.exchange] == nil {
+                    exchangeOrder.append(entry.exchange)
+                }
+                byExchange[entry.exchange, default: []].append(entry)
+            }
+            var idx = 0
+            var remaining = tierEntries.count
+            while remaining > 0 && result.count < limit {
+                for ex in exchangeOrder {
+                    guard result.count < limit else { break }
+                    if idx < (byExchange[ex]?.count ?? 0) {
+                        result.append(byExchange[ex]![idx])
+                        remaining -= 1
+                    }
+                }
+                idx += 1
+            }
+        }
+
+        // --- Temporary AVAX debug ---
+        if isAvaxQuery {
+            let avaxResults = result.filter { $0.symbol.uppercased().contains("AVAX") || $0.baseAsset.uppercased() == "AVAX" }
+            print("FINAL SEARCH RESULTS FOR AVAX: \(avaxResults.count) of \(result.count) total → \(avaxResults.map { "\($0.exchange):\($0.symbol)" })")
+        }
+
+        return result
     }
 
     /// Find all exchanges that list a given symbol (e.g. "ETHUSDT" → [BINANCE, OKX, BYBIT, ...])
@@ -132,14 +189,21 @@ actor ExchangeSymbolIndex {
             lastRefresh = cached.date
             isLoaded = true
 
-            // Background refresh if stale
             let age = Date().timeIntervalSince(cached.date)
-            if age > Self.refreshInterval {
-                Task { await fetchAllExchanges() }
+            let exchangeCount = Set(cached.symbols.map(\.exchange)).count
+            let cachedAvax = cached.symbols.filter { $0.baseAsset.uppercased() == "AVAX" || $0.symbol.uppercased().contains("AVAX") }
+            print("[ExchangeSymbolIndex] Loaded from disk cache: \(cached.symbols.count) symbols, \(exchangeCount) exchanges, age=\(Int(age))s, avaxEntries=\(cachedAvax.count) → \(cachedAvax.map { "\($0.exchange):\($0.symbol)" })")
+
+            // Refresh if stale OR if the cache has too few exchanges (sparse from a bad load)
+            if age > Self.refreshInterval || exchangeCount < 8 {
+                // AWAIT the refresh so searches see the fresh data
+                // (loadIndex runs inside loadTask, so search() waits via ensureLoaded)
+                await fetchAllExchanges()
             }
             return
         }
 
+        print("[ExchangeSymbolIndex] No disk cache — fetching from exchanges")
         // No cache — fetch from exchanges
         await fetchAllExchanges()
     }
@@ -171,19 +235,45 @@ actor ExchangeSymbolIndex {
             return all
         }
 
+        // --- Temporary AVAX debug: per-exchange fetch results ---
+        let exchangeNames = ["BINANCE","BYBIT","OKX","KUCOIN","COINBASE","KRAKEN","GATEIO","MEXC","HTX","BITGET","HYPERLIQUID"]
+        for batch in results {
+            let ex = batch.first?.exchange ?? "EMPTY"
+            let avaxEntries = batch.filter { $0.baseAsset.uppercased() == "AVAX" || $0.symbol.uppercased().hasPrefix("AVAX") }
+            print("EXCHANGE FETCH AVAX: \(ex) total=\(batch.count) avax=\(avaxEntries.map { "\($0.exchange):\($0.symbol)" })")
+        }
+
         var allSymbols = results.flatMap { $0 }
         allSymbols.append(contentsOf: Self.macroSymbols)
 
-        symbols = allSymbols
-        lastRefresh = Date()
-        isLoaded = true
+        // --- Temporary AVAX debug: all indexed AVAX entries ---
+        let indexedAvax = allSymbols.filter { $0.baseAsset.uppercased() == "AVAX" || $0.symbol.uppercased().contains("AVAX") }
+        print("INDEXED AVAX ENTRIES: \(indexedAvax.count) → \(indexedAvax.map { "\($0.exchange):\($0.symbol)" })")
 
-        // Persist to disk
-        saveToDisk(symbols: allSymbols, date: Date())
+        // Only accept if we got a reasonable number of exchanges (avoid caching sparse data)
+        let exchangeCount = Set(allSymbols.map(\.exchange)).count
+        let previousExchangeCount = Set(symbols.map(\.exchange)).count
+        let minExchanges = 6  // require at least 6 exchanges to cache
 
-        #if DEBUG
-        print("[ExchangeSymbolIndex] Loaded \(allSymbols.count) symbols from \(fetchers.count) exchanges + macros")
-        #endif
+        if exchangeCount >= minExchanges || symbols.isEmpty {
+            symbols = allSymbols
+            lastRefresh = Date()
+            isLoaded = true
+
+            // Only save to disk if the new data is at least as rich as the old data
+            if exchangeCount >= minExchanges && exchangeCount >= previousExchangeCount {
+                saveToDisk(symbols: allSymbols, date: Date())
+            }
+            print("[ExchangeSymbolIndex] Accepted refresh: \(allSymbols.count) symbols from \(exchangeCount) exchanges (previous: \(previousExchangeCount))")
+        } else {
+            print("[ExchangeSymbolIndex] Sparse refresh (\(exchangeCount) exchanges, need \(minExchanges)) — keeping existing \(symbols.count) symbols from \(previousExchangeCount) exchanges")
+            if !isLoaded {
+                symbols = allSymbols
+                isLoaded = true
+            }
+        }
+
+        print("[ExchangeSymbolIndex] Loaded \(allSymbols.count) symbols from \(exchangeCount) exchanges")
     }
 
     // MARK: - Scoring

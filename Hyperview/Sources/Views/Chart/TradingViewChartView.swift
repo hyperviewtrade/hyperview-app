@@ -751,7 +751,8 @@ struct TradingViewChartView: UIViewRepresentable {
         /// "HYPEUSDT" → "HYPE-USDT" (KuCoin format)
         private static func tvPairToKuCoinSymbol(_ pair: String) -> String {
             let clean = pair.replacingOccurrences(of: ".P", with: "")
-            for quote in ["USDT", "USDC", "BTC", "ETH", "KCS", "BUSD"] {
+            for quote in ["USDT", "USDC", "BUSD", "BTC", "ETH", "KCS",
+                          "EUR", "GBP", "BRL", "TRY", "ARS", "USD"] {
                 if clean.uppercased().hasSuffix(quote) && clean.count > quote.count {
                     let base = String(clean.dropLast(quote.count))
                     return "\(base)-\(quote)"
@@ -763,7 +764,9 @@ struct TradingViewChartView: UIViewRepresentable {
         /// "HYPEUSDT" → "HYPE-USDT" (OKX instId format)
         private static func tvPairToOKXInstId(_ pair: String) -> String {
             let clean = pair.replacingOccurrences(of: ".P", with: "")
-            for quote in ["USDT", "USDC", "BTC", "ETH", "BUSD"] {
+            // OKX uses "BASE-QUOTE" format — match longest quote suffix first
+            for quote in ["USDT", "USDC", "BUSD", "BTC", "ETH",
+                          "EUR", "GBP", "BRL", "TRY", "ARS", "USD"] {
                 if clean.uppercased().hasSuffix(quote) && clean.count > quote.count {
                     let base = String(clean.dropLast(quote.count))
                     return "\(base)-\(quote)"
@@ -775,7 +778,8 @@ struct TradingViewChartView: UIViewRepresentable {
         /// "HYPEUSDT" → "HYPE-USDT" (Coinbase product format — also handles USD)
         private static func tvPairToCoinbaseProduct(_ pair: String) -> String {
             let clean = pair.replacingOccurrences(of: ".P", with: "")
-            for quote in ["USDT", "USDC", "USD", "BTC", "ETH"] {
+            for quote in ["USDT", "USDC", "BUSD", "BTC", "ETH",
+                          "EUR", "GBP", "BRL", "TRY", "ARS", "USD"] {
                 if clean.uppercased().hasSuffix(quote) && clean.count > quote.count {
                     let base = String(clean.dropLast(quote.count))
                     return "\(base)-\(quote)"
@@ -792,7 +796,8 @@ struct TradingViewChartView: UIViewRepresentable {
         /// "HYPEUSDT" → "HYPE_USDT" (Gate.io format)
         private static func tvPairToGateIOSymbol(_ pair: String) -> String {
             let clean = pair.replacingOccurrences(of: ".P", with: "")
-            for quote in ["USDT", "USDC", "BTC", "ETH", "BUSD"] {
+            for quote in ["USDT", "USDC", "BUSD", "BTC", "ETH",
+                          "EUR", "GBP", "BRL", "TRY", "ARS", "USD"] {
                 if clean.uppercased().hasSuffix(quote) && clean.count > quote.count {
                     let base = String(clean.dropLast(quote.count))
                     return "\(base)_\(quote)"
