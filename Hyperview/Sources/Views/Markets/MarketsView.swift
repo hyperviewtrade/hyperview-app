@@ -810,15 +810,19 @@ struct MarketsView: View {
         let displayed = vm.filteredMarkets(watched: Set(watchVM.symbols))
         let customCharts = customChartStore.charts
 
-        // Build unified list: favorites first, then custom charts, then the rest
+        // Build unified list: ALL favorites first (normal + custom), then the rest
         var unified: [ListItem] = []
         let watchedSet = Set(watchVM.symbols)
         if vm.searchQuery.isEmpty {
-            // Split HL markets into favorites and non-favorites
-            let favMarkets = displayed.filter { watchedSet.contains($0.symbol) }
+            // Split both HL markets AND custom charts into favorites / non-favorites
+            let favMarkets    = displayed.filter { watchedSet.contains($0.symbol) }
             let nonFavMarkets = displayed.filter { !watchedSet.contains($0.symbol) }
-            unified += favMarkets.map { .market($0) }
-            unified += customCharts.map { .custom($0) }
+            let favCustom     = customCharts.filter { watchedSet.contains("TV:\($0.symbol)") }
+            let nonFavCustom  = customCharts.filter { !watchedSet.contains("TV:\($0.symbol)") }
+            // Favorites first (normal then custom), then non-favorites
+            unified += favMarkets.map  { .market($0) }
+            unified += favCustom.map   { .custom($0) }
+            unified += nonFavCustom.map { .custom($0) }
             unified += nonFavMarkets.map { .market($0) }
         } else {
             unified += displayed.map { .market($0) }

@@ -228,7 +228,13 @@ final class MarketsViewModel: ObservableObject {
     func filteredMarkets(watched: Set<String> = []) -> [Market] {
         if watched != lastWatched {
             lastWatched = watched
-            cachedFilteredMarkets = computeFilteredMarkets(watched: watched)
+            // Defer the @Published mutation to the next run loop iteration so it
+            // never fires during an in-progress SwiftUI view update pass.
+            // (Setting cachedFilteredMarkets synchronously here caused the
+            // "Publishing changes from within view updates" warning.)
+            DispatchQueue.main.async { [self] in
+                cachedFilteredMarkets = computeFilteredMarkets(watched: watched)
+            }
         }
         return cachedFilteredMarkets
     }
