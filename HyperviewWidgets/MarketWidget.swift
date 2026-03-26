@@ -765,11 +765,20 @@ private enum SharedMarketReader {
     /// Lightweight fallback: fetch only allMids (much smaller payload than metaAndAssetCtxs)
     static func fetchAllMidsFallback(markets: [WidgetMarket], fresh: Bool = false) async -> [String: (price: Double, change: Double, volume: Double)] {
         let dailyOpens = fresh ? await fetchDailyOpensFromBackend(fresh: true) : loadDailyOpens()
-        let hasHIP3 = markets.contains { $0.symbol.contains(":") }
+        let hip3Markets = markets.filter { $0.symbol.contains(":") }
+        let hasHIP3 = !hip3Markets.isEmpty
+
+        // Extract unique DEX prefixes from HIP-3 symbols (e.g. "xyz" from "xyz:GOLD")
+        let neededDexes: Set<String> = Set(hip3Markets.compactMap { m in
+            let sym = m.symbol
+            guard let colon = sym.firstIndex(of: ":") else { return nil }
+            let dex = String(sym[sym.startIndex..<colon])
+            return dex.isEmpty ? nil : dex
+        })
 
         // Launch ALL fetches in parallel
         async let midsTask = fetchAllMids()
-        async let hip3Task: [String: Double] = hasHIP3 ? fetchHIP3Prices(fresh: fresh) : [:]
+        async let hip3Task: [String: Double] = hasHIP3 ? fetchHIP3Prices(fresh: fresh, neededDexes: neededDexes) : [:]
 
         let mids = await midsTask
         let hip3Prices = await hip3Task
@@ -819,10 +828,15 @@ private enum SharedMarketReader {
 
     /// Fetch HIP-3 prices from our backend /all-prices
     /// If that fails, fetch each HIP-3 DEX from HL in parallel (not sequentially).
-    /// - Parameter fresh: When true, appends ?fresh=1 to bypass backend cache.
-    private static func fetchHIP3Prices(fresh: Bool = false) async -> [String: Double] {
+    /// - Parameters:
+    ///   - fresh: When true, appends ?fresh=1 to bypass backend cache.
+    ///   - neededDexes: When non-empty, tells the backend to only refresh these DEXes (saves API calls).
+    private static func fetchHIP3Prices(fresh: Bool = false, neededDexes: Set<String> = []) async -> [String: Double] {
         // Try 1: Our backend (has all HIP-3 cached)
-        let suffix = fresh ? "?fresh=1" : ""
+        var suffix = fresh ? "?fresh=1" : ""
+        if fresh && !neededDexes.isEmpty {
+            suffix += "&dexes=\(neededDexes.sorted().joined(separator: ","))"
+        }
         if let url = URL(string: "https://hyperview-backend-production-075c.up.railway.app/all-prices\(suffix)") {
             var request = URLRequest(url: url, timeoutInterval: 12)
             if fresh { request.cachePolicy = .reloadIgnoringLocalCacheData }
@@ -840,8 +854,8 @@ private enum SharedMarketReader {
             }
         }
 
-        // Try 2: Fetch directly from HL for most common HIP-3 DEXes — in parallel.
-        let dexes = ["xyz", "cash", "km"]
+        // Try 2: Fetch directly from HL for needed DEXes (or fallback to common ones) — in parallel.
+        let dexes = neededDexes.isEmpty ? ["xyz", "cash", "km"] : Array(neededDexes)
         var combined: [String: Double] = [:]
         await withTaskGroup(of: [String: Double].self) { group in
             for dex in dexes {

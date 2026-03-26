@@ -250,12 +250,14 @@ struct Market: Identifiable {
         return String(format: "%.0f", v)
     }
 
+    /// Price decimals derived from szDecimals — matches Hyperliquid's display precision.
+    var priceDecimals: Int {
+        let maxBase = isSpot ? 8 : 6
+        return max(0, min(maxBase - asset.szDecimals, 8))
+    }
+
     func format(_ p: Double) -> String {
-        if p >= 10_000 { return String(format: "%.1f", p) }
-        if p >= 1_000  { return String(format: "%.2f", p) }
-        if p >= 1      { return String(format: "%.4f", p) }
-        if p >= 0.01   { return String(format: "%.5f", p) }
-        return String(format: "%.8f", p)
+        return String(format: "%.\(priceDecimals)f", p)
     }
 }
 

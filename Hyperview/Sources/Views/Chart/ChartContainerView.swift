@@ -295,6 +295,25 @@ struct ChartContainerView: View {
     // MARK: - Formatters
 
     private func formatPrice(_ p: Double) -> String {
+        // Use szDecimals-derived precision for Hyperliquid markets (matches chart Y-axis)
+        if !chartVM.isCustomTVChart {
+            let symbol = chartVM.selectedSymbol
+            let isSpot = symbol.hasPrefix("@") || symbol.contains("/")
+            let baseCoin: String = {
+                if symbol.hasPrefix("@") { return symbol }
+                if let slash = symbol.firstIndex(of: "/") { return String(symbol[..<slash]) }
+                if symbol.contains(":") {
+                    let parts = symbol.split(separator: ":", maxSplits: 1)
+                    return parts.count > 1 ? String(parts[1]) : symbol
+                }
+                return symbol
+            }()
+            let szDec = MarketsViewModel.szDecimals(for: baseCoin)
+            let maxBase = isSpot ? 8 : 6
+            let decimals = max(0, min(maxBase - szDec, 8))
+            return String(format: "%.\(decimals)f", p)
+        }
+        // Fallback for custom TradingView charts
         if p >= 10_000 { return String(format: "%.1f", p) }
         if p >= 1_000  { return String(format: "%.2f", p) }
         if p >= 1      { return String(format: "%.4f", p) }

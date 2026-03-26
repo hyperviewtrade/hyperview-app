@@ -14,8 +14,23 @@ final class MarketsViewModel: ObservableObject {
     ]
 
     /// Returns szDecimals for a given coin name (e.g. "BTC" → 5, "ETH" → 4)
+    /// Also handles HIP-3 lookups: "WTIOIL" matches "xyz:WTIOIL" in cache.
     static func szDecimals(for coin: String) -> Int {
-        szDecimalsCache[coin] ?? 4
+        // Direct match (handles both "BTC" and "xyz:WTIOIL" as keys)
+        if let v = szDecimalsCache[coin] { return v }
+        // Try with dex prefix stripped (chart passes "WTIOIL", cache has "xyz:WTIOIL")
+        if coin.contains(":") {
+            let stripped = String(coin.split(separator: ":", maxSplits: 1).last ?? Substring(coin))
+            if let v = szDecimalsCache[stripped] { return v }
+        }
+        // Reverse: coin is "WTIOIL", search cache for any "xxx:WTIOIL" key
+        if !coin.contains(":") {
+            let suffix = ":\(coin)"
+            for (key, val) in szDecimalsCache where key.hasSuffix(suffix) {
+                return val
+            }
+        }
+        return 4
     }
 
     /// Cache of spot pair names: "@107" → "HYPE", "@142" → "BTC", etc.
@@ -610,6 +625,10 @@ final class MarketsViewModel: ObservableObject {
         // Update szDecimals cache for position formatting
         for m in markets {
             Self.szDecimalsCache[m.asset.name] = m.asset.szDecimals
+            // Also store under stripped name for HIP-3 (e.g. "WTIOIL" from "xyz:WTIOIL")
+            if m.isHIP3, let stripped = m.asset.name.split(separator: ":", maxSplits: 1).last {
+                Self.szDecimalsCache[String(stripped)] = m.asset.szDecimals
+            }
             // Populate spot name map: "@107" → "HYPE/USDC", "@142" → "BTC/USDC"
             if m.isSpot, !m.spotCoin.isEmpty {
                 Self.spotNameMap[m.spotCoin] = m.displaySymbol
