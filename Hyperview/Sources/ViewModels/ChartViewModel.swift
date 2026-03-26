@@ -113,11 +113,14 @@ final class ChartViewModel: ObservableObject {
             forName: WebSocketManager.didReconnect, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            Task { @MainActor in
-                // Refetch order book snapshot to reconcile stale WS state
-                await self.fetchAndSeedOrderBook()
-                // Refetch recent candles to fill any gap from the disconnect
-                await self.fillCandleGap()
+            // Use DispatchQueue.main.async to defer any @Published mutations
+            // until after the current run loop iteration (avoids publishing
+            // during an in-progress SwiftUI view update).
+            DispatchQueue.main.async {
+                Task { @MainActor in
+                    await self.fetchAndSeedOrderBook()
+                    await self.fillCandleGap()
+                }
             }
         }
     }
@@ -341,17 +344,22 @@ final class ChartViewModel: ObservableObject {
             .sink { [weak self] mids in
                 guard let self else { return }
                 if let priceStr = mids[priceCoin], let price = Double(priceStr) {
-                    self.livePrice = price
+                    // Defer to next run loop to avoid publishing during a view update
+                    DispatchQueue.main.async {
+                        self.livePrice = price
+                    }
                 }
             }
             .store(in: &cancellables)
 
-        // Candle updates — use Task { @MainActor } so actor isolation is explicit
-        ws.onCandle = { candle in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                guard candle.s == rawCoin, candle.i == rawInterval else { return }
-                self.upsertCandle(candle)
+        // Candle updates — use DispatchQueue.main.async to avoid publishing
+        // @Published changes during an in-progress SwiftUI view update pass.
+        // (Task { @MainActor } can be scheduled mid-update, causing the
+        // "Publishing changes from within view updates" warning.)
+        ws.onCandle = { [weak self] candle in
+            guard candle.s == rawCoin, candle.i == rawInterval else { return }
+            DispatchQueue.main.async {
+                self?.upsertCandle(candle)
             }
         }
     }
@@ -454,7 +462,9 @@ final class ChartViewModel: ObservableObject {
         }
 
         ws.onOrderBook = { [weak self] book, coin in
-            Task { @MainActor [weak self] in
+            // Use DispatchQueue.main.async to avoid publishing @Published changes
+            // during an in-progress SwiftUI view update pass.
+            DispatchQueue.main.async {
                 guard let self, coin == rawCoin else { return }
                 // No localBids.isEmpty gate — the first WS message is always a full
                 // snapshot that seeds the book even when REST returned nothing.
