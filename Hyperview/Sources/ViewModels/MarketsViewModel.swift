@@ -85,6 +85,8 @@ final class MarketsViewModel: ObservableObject {
     private let updateInterval: TimeInterval = 1.5
     private var lastWidgetReload: Date = .distantPast
     private let widgetReloadInterval: TimeInterval = 600  // 10 minutes
+    /// Symbols written to widget on last share — used to detect order changes.
+    private var lastWidgetSymbols: [String] = []
     /// Main-DEX asset names — used to distinguish HIP-3 crypto vs tradfi
     private var mainDexAssetNames: Set<String> = []
     private var annotationsSub: AnyCancellable?
@@ -356,7 +358,8 @@ final class MarketsViewModel: ObservableObject {
     /// Throttled: only triggers WidgetKit reload at most once every 10 minutes.
     private func shareMarketsWithWidget(_ markets: [Market]) {
         guard let defaults = UserDefaults(suiteName: "group.com.Hyperview.Hyperview") else { return }
-        let top = markets.prefix(10).map { m -> [String: Any] in
+        let topMarkets = Array(markets.prefix(10))
+        let top = topMarkets.map { m -> [String: Any] in
             let lp = livePrices[m.symbol] ?? m.price
             let chg: Double = {
                 if let open = m.dailyOpenPrice, open > 0 {
@@ -375,8 +378,13 @@ final class MarketsViewModel: ObservableObject {
         }
         defaults.set(top, forKey: "widget_shared_markets")
 
+        // Detect if the market order changed (different symbols or sequence)
+        let currentSymbols = topMarkets.map(\.symbol)
+        let orderChanged = currentSymbols != lastWidgetSymbols
+        lastWidgetSymbols = currentSymbols
+
         let now = Date()
-        if now.timeIntervalSince(lastWidgetReload) >= widgetReloadInterval {
+        if orderChanged || now.timeIntervalSince(lastWidgetReload) >= widgetReloadInterval {
             lastWidgetReload = now
             WidgetCenter.shared.reloadTimelines(ofKind: "MarketWidget")
         }
