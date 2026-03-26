@@ -228,9 +228,34 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background {
-                // Flush current market order to App Group so the widget
-                // reflects the latest in-app arrangement immediately.
-                marketsVM.forceWidgetReload()
+                // Build the unified display order (same logic as MarketsView.marketsList)
+                // so the widget shows custom charts at their correct positions.
+                let watchedSet = Set(watchVM.symbols)
+                let displayed = marketsVM.cachedFilteredMarkets
+                let customCharts = CustomChartStore.shared.charts
+
+                let favMarkets    = displayed.filter { watchedSet.contains($0.symbol) }
+                let nonFavMarkets = displayed.filter { !watchedSet.contains($0.symbol) }
+                let favCustom     = customCharts.filter { watchedSet.contains("TV:\($0.symbol)") }
+                let nonFavCustom  = customCharts.filter { !watchedSet.contains("TV:\($0.symbol)") }
+
+                var orderKeys: [String] = []
+                orderKeys += favMarkets.map(\.symbol)
+                orderKeys += favCustom.map { "TV:\($0.symbol)" }
+                orderKeys += nonFavCustom.map { "TV:\($0.symbol)" }
+                orderKeys += nonFavMarkets.map(\.symbol)
+
+                // Apply custom symbol order if user has manually reordered
+                if let savedOrder = marketsVM.customSymbolOrder {
+                    let orderMap = Dictionary(uniqueKeysWithValues: savedOrder.enumerated().map { ($1, $0) })
+                    orderKeys.sort { a, b in
+                        let ia = orderMap[a] ?? Int.max
+                        let ib = orderMap[b] ?? Int.max
+                        return ia < ib
+                    }
+                }
+
+                marketsVM.forceWidgetReload(unifiedOrder: orderKeys)
                 wallet.lockApp()
             } else if phase == .active && !wallet.isUnlocked && (wallet.biometricEnabled || wallet.hasPassword) {
                 Task { await wallet.authenticateAppLaunch() }

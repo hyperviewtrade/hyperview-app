@@ -11,7 +11,7 @@ struct MarketsView: View {
     @ObservedObject private var customChartStore = CustomChartStore.shared
 
     /// Live price + 24h change for custom TradingView charts (fetched from Binance)
-    @State private var customPrices: [String: (price: Double, change: Double)] = [:]
+    @State private var customPrices: [String: (price: Double, change: Double)] = Self.loadCachedCustomPrices()
     /// Timestamp of last custom price fetch — avoid re-fetching within 30s on tab switches
     @State private var lastCustomPriceFetch: Date = .distantPast
 
@@ -247,7 +247,31 @@ struct MarketsView: View {
         await MainActor.run {
             customPrices = newPrices
             lastCustomPriceFetch = Date()
+            Self.saveCachedCustomPrices(newPrices)
         }
+    }
+
+    // MARK: - Custom price caching (instant display on next launch)
+
+    private static let customPriceCacheKey = "cached_custom_chart_prices"
+
+    private static func loadCachedCustomPrices() -> [String: (price: Double, change: Double)] {
+        guard let arr = UserDefaults.standard.array(forKey: customPriceCacheKey) as? [[String: Any]] else { return [:] }
+        var dict: [String: (price: Double, change: Double)] = [:]
+        for item in arr {
+            guard let sym = item["s"] as? String,
+                  let p = item["p"] as? Double,
+                  let c = item["c"] as? Double else { continue }
+            dict[sym] = (p, c)
+        }
+        return dict
+    }
+
+    private static func saveCachedCustomPrices(_ prices: [String: (price: Double, change: Double)]) {
+        let arr: [[String: Any]] = prices.map { (sym, val) in
+            ["s": sym, "p": val.price, "c": val.change]
+        }
+        UserDefaults.standard.set(arr, forKey: customPriceCacheKey)
     }
 
     /// Check if a symbol is an expression (ratio) like "BINANCE:X/OKX:Y"
