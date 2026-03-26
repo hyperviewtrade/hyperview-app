@@ -16,6 +16,7 @@ struct WidgetMarket: Identifiable {
     var iconQuote: String? = nil   // non-nil → dual icon (pair chart)
     var iconQuoteData: Data? = nil
     var isCustomTV: Bool = false
+    var priceDecimals: Int? = nil  // from szDecimals — nil falls back to magnitude-based
 
     var isPositive: Bool { change24h >= 0 }
 
@@ -32,6 +33,10 @@ struct WidgetMarket: Identifiable {
     }
 
     var formattedPrice: String {
+        if let dec = priceDecimals {
+            return "$" + String(format: "%.\(dec)f", price)
+        }
+        // Fallback for custom TV charts (no szDecimals available)
         if price >= 10_000 { return String(format: "$%.0f", price) }
         if price >= 1_000  { return String(format: "$%.1f", price) }
         if price >= 1      { return String(format: "$%.2f", price) }
@@ -80,13 +85,15 @@ private enum WidgetCache {
     static let key = "widget_market_cache"
 
     static func save(_ markets: [WidgetMarket]) {
-        let data = markets.map {
-            [
-                "n": $0.name, "s": $0.symbol, "p": $0.price, "c": $0.change24h, "v": $0.volume24h,
-                "i": $0.iconData?.base64EncodedString() ?? "",
-                "ic": $0.iconName,
-                "tv": $0.isCustomTV
-            ] as [String: Any]
+        let data = markets.map { m -> [String: Any] in
+            var dict: [String: Any] = [
+                "n": m.name, "s": m.symbol, "p": m.price, "c": m.change24h, "v": m.volume24h,
+                "i": m.iconData?.base64EncodedString() ?? "",
+                "ic": m.iconName,
+                "tv": m.isCustomTV
+            ]
+            if let dec = m.priceDecimals { dict["dec"] = dec }
+            return dict
         }
         UserDefaults.standard.set(data, forKey: key)
     }
@@ -103,7 +110,8 @@ private enum WidgetCache {
             let iconData = iconB64.isEmpty ? nil : Data(base64Encoded: iconB64)
             let iconName = dict["ic"] as? String ?? name
             let isCustomTV = dict["tv"] as? Bool ?? false
-            return WidgetMarket(name: name, symbol: symbol, price: price, change24h: change, volume24h: volume, iconData: iconData, iconName: iconName, isCustomTV: isCustomTV)
+            let dec = dict["dec"] as? Int
+            return WidgetMarket(name: name, symbol: symbol, price: price, change24h: change, volume24h: volume, iconData: iconData, iconName: iconName, isCustomTV: isCustomTV, priceDecimals: dec)
         }
     }
 }
@@ -579,8 +587,10 @@ private enum SharedMarketReader {
                   let volume = dict["v"] as? Double else { return nil }
             let symbol = dict["s"] as? String ?? name
             let iconName = dict["icon"] as? String ?? name
+            let dec = dict["dec"] as? Int
             return WidgetMarket(name: name, symbol: symbol, price: price, change24h: change,
-                                volume24h: volume, iconData: nil, iconName: iconName)
+                                volume24h: volume, iconData: nil, iconName: iconName,
+                                priceDecimals: dec)
         }
 
         // If the user has manually reordered, respect that unified order
@@ -653,7 +663,8 @@ private enum SharedMarketReader {
                 iconData: allIcons[markets[i].iconName], iconName: markets[i].iconName,
                 iconQuote: markets[i].iconQuote,
                 iconQuoteData: markets[i].iconQuote.flatMap { allIcons[$0] },
-                isCustomTV: markets[i].isCustomTV
+                isCustomTV: markets[i].isCustomTV,
+                priceDecimals: markets[i].priceDecimals
             )
         }
         return markets
@@ -1002,8 +1013,10 @@ struct RefreshMarketsIntent: AppIntent {
                   let volume = dict["v"] as? Double else { return nil }
             let symbol = dict["s"] as? String ?? name
             let iconName = dict["icon"] as? String ?? name
+            let dec = dict["dec"] as? Int
             return WidgetMarket(name: name, symbol: symbol, price: price, change24h: change,
-                                volume24h: volume, iconData: nil, iconName: iconName)
+                                volume24h: volume, iconData: nil, iconName: iconName,
+                                priceDecimals: dec)
         }
 
         let hip3Symbols = markets.filter { $0.symbol.contains(":") }.map { "[\($0.symbol) n=\($0.name)]" }
@@ -1104,14 +1117,14 @@ struct MarketWidgetProvider: TimelineProvider {
                                             change24h: fresh.change, volume24h: 0,
                                             iconData: m.iconData, iconName: m.iconName,
                                             iconQuote: m.iconQuote, iconQuoteData: m.iconQuoteData,
-                                            isCustomTV: true)
+                                            isCustomTV: true, priceDecimals: m.priceDecimals)
                     }
                     if let fresh = freshPrices[m.name] {
                         return WidgetMarket(name: m.name, symbol: m.symbol, price: fresh.price,
                                             change24h: fresh.change, volume24h: fresh.volume,
                                             iconData: m.iconData, iconName: m.iconName,
                                             iconQuote: m.iconQuote, iconQuoteData: m.iconQuoteData,
-                                            isCustomTV: m.isCustomTV)
+                                            isCustomTV: m.isCustomTV, priceDecimals: m.priceDecimals)
                     }
                     return m
                 }

@@ -627,6 +627,9 @@ struct PositionDetailSheet: View {
     }
 
     private func formatPrice(_ price: Double) -> String {
+        if let m = market {
+            return m.format(price)
+        }
         if price >= 1000 { return String(format: "%.2f", price) }
         if price >= 1 { return String(format: "%.4f", price) }
         return String(format: "%.6f", price)

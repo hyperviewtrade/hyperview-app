@@ -219,7 +219,7 @@ struct ChartContainerView: View {
         }
     }
 
-    /// Compact Long / Short buttons pinned below the chart
+    /// Compact Long / Short (perp) or Buy / Sell (spot) buttons pinned below the chart
     private var longShortButtons: some View {
         HStack(spacing: 10) {
             Button {
@@ -227,7 +227,7 @@ struct ChartContainerView: View {
                 tradingVM.side = .buy
                 withAnimation(.easeInOut(duration: 0.2)) { tab = .trade }
             } label: {
-                Text("Long")
+                Text(chartVM.isSpotMarket ? "Buy" : "Long")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
@@ -241,7 +241,7 @@ struct ChartContainerView: View {
                 tradingVM.side = .sell
                 withAnimation(.easeInOut(duration: 0.2)) { tab = .trade }
             } label: {
-                Text("Short")
+                Text(chartVM.isSpotMarket ? "Sell" : "Short")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)

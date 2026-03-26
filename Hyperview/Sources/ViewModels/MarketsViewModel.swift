@@ -379,7 +379,8 @@ final class MarketsViewModel: ObservableObject {
                 "p": lp,
                 "c": chg,
                 "v": m.volume24h,
-                "icon": m.hlCoinIconName
+                "icon": m.hlCoinIconName,
+                "dec": m.priceDecimals
             ]
         }
         defaults.set(top, forKey: "widget_shared_markets")
@@ -427,7 +428,8 @@ final class MarketsViewModel: ObservableObject {
                 return [
                     "n": m.displaySymbol, "s": m.symbol,
                     "p": lp, "c": chg, "v": m.volume24h,
-                    "icon": m.hlCoinIconName
+                    "icon": m.hlCoinIconName,
+                    "dec": m.priceDecimals
                 ]
             }
 

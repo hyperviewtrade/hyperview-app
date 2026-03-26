@@ -2416,6 +2416,10 @@ struct TradeTabView: View {
     // MARK: - Formatters
 
     private func formatPrice(_ p: Double) -> String {
+        if let m = currentMarket {
+            return m.format(p)
+        }
+        // Fallback when market object isn't available
         if p >= 10_000 { return String(format: "%.1f", p) }
         if p >= 1_000  { return String(format: "%.2f", p) }
         if p >= 1      { return String(format: "%.4f", p) }
