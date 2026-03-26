@@ -569,7 +569,8 @@ private enum SharedMarketReader {
         let customCharts = loadCustomCharts()
 
         // --- Temporary debug log ---
-        print("WIDGET APP GROUP READ TOP10: \(arr.prefix(10).compactMap { ($0["s"] as? String) })")
+        let readSymbols = arr.prefix(10).compactMap { ($0["s"] as? String) }
+        print("WIDGET APP GROUP READ TOP10: \(readSymbols)")
 
         let hlMarkets = arr.compactMap { dict -> WidgetMarket? in
             guard let name = dict["n"] as? String,
@@ -616,13 +617,14 @@ private enum SharedMarketReader {
             }
             markets = ordered
         } else {
-            // Default: insert custom charts after the last favorite in the already-ordered list
-            let insertIdx = hlMarkets.lastIndex(where: { watchSet.contains($0.symbol) })
-                .map { $0 + 1 } ?? 0
-            markets = Array(hlMarkets.prefix(insertIdx)) + customCharts + Array(hlMarkets.dropFirst(insertIdx))
+            // The app writes widget_shared_markets in exact display order
+            // (favorites first, then the rest). Preserve that order as-is
+            // and just append any custom TradingView charts at the end.
+            markets = hlMarkets + customCharts
         }
 
-        // --- Temporary debug log ---
+        // --- Temporary debug logs ---
+        print("WIDGET POST-PROCESS TOP10: \(markets.prefix(10).map(\.symbol))")
         print("WIDGET FINAL DISPLAY TOP10: \(markets.prefix(10).map(\.symbol))")
 
         // Build icon map from WidgetCache — reuse already-fetched icons, only download new ones.

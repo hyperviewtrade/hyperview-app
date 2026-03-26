@@ -403,6 +403,10 @@ final class MarketsViewModel: ObservableObject {
         let defaults = UserDefaults(suiteName: "group.com.Hyperview.Hyperview")
         if let order = unifiedOrder {
             defaults?.set(order, forKey: "widget_unified_order")
+        } else {
+            // Clear any stale drag-reorder so the widget uses the fresh
+            // App Group order written below instead of a stale symbol list.
+            defaults?.removeObject(forKey: "widget_unified_order")
         }
         // Use the same filtered/sorted/favorites-first list that the UI displays,
         // NOT the raw `markets` array (which is unsorted API order).
