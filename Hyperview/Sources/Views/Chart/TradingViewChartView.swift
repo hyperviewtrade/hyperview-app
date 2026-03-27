@@ -223,28 +223,30 @@ struct TradingViewChartView: UIViewRepresentable {
 
         private func handleResolveSymbolHL(_ symbol: String, requestId: Int) async {
             let vm = chartVM
+            let interval = vm?.selectedInterval ?? .oneHour
 
-            // Try to get reference price from multiple sources:
-            // 1. ViewModel candles (loaded by loadChart before resolveSymbol)
-            var referencePrice = vm?.candles.last?.close ?? 0
+            // IMPORTANT: Only use symbol-specific price sources.
+            // vm.candles and vm.livePrice may still hold the PREVIOUS symbol's data
+            // during changeSymbol, which would give completely wrong pricescale.
 
-            // 2. Candle cache (filled by prefetchCandles during changeSymbol)
+            var referencePrice: Double = 0
+
+            // 1. Candle cache — keyed by exact symbol, always correct
             if referencePrice == 0 {
-                let interval = vm?.selectedInterval ?? .oneHour
                 let key = "\(symbol):\(interval.rawValue)"
                 referencePrice = Self.candleCache[key]?.candles.last?.close ?? 0
             }
 
-            // 3. Await in-flight prefetch — this ensures we have accurate data
+            // 2. Await in-flight prefetch for THIS symbol — guarantees correct data
             if referencePrice == 0, let prefetch = activePrefetch, prefetch.key.hasPrefix("\(symbol):") {
                 if let candles = try? await prefetch.task.value, let last = candles.last {
                     referencePrice = last.close
                 }
             }
 
-            // 4. Live price from WebSocket
-            if referencePrice == 0 {
-                referencePrice = vm?.livePrice ?? 0
+            // 3. Only use vm.candles if the symbol matches (not stale from previous)
+            if referencePrice == 0, vm?.selectedSymbol == symbol {
+                referencePrice = vm?.candles.last?.close ?? 0
             }
 
             // Compute pricescale using 5 significant figures — matches header display

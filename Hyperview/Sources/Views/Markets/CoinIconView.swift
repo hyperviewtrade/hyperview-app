@@ -161,11 +161,38 @@ private let _coreSVGAvailable: Bool = {
 
 private let iconSession: URLSession = {
     let cfg = URLSessionConfiguration.default
-    cfg.httpMaximumConnectionsPerHost = 20
-    cfg.timeoutIntervalForRequest = 15
-    cfg.urlCache = URLCache(memoryCapacity: 20_000_000, diskCapacity: 100_000_000)
+    cfg.httpMaximumConnectionsPerHost = 4
+    cfg.timeoutIntervalForRequest = 10
+    cfg.urlCache = URLCache(memoryCapacity: 10_000_000, diskCapacity: 50_000_000)
     return URLSession(configuration: cfg)
 }()
+
+// MARK: - Global concurrency limiter for icon CDN fetches
+
+private actor IconFetchLimiter {
+    static let shared = IconFetchLimiter()
+    private var active = 0
+    private let maxConcurrent = 6
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if active < maxConcurrent {
+            active += 1
+            return
+        }
+        await withCheckedContinuation { cont in
+            waiters.append(cont)
+        }
+    }
+
+    func release() {
+        active -= 1
+        if !waiters.isEmpty {
+            active += 1
+            waiters.removeFirst().resume()
+        }
+    }
+}
 
 // MARK: - SVG icon cache
 
@@ -226,8 +253,7 @@ private struct SVGIconView: View {
     }
 
     private func loadAndRender() async {
-        // 1. Try local disk cache (from IconCacheService bundle)
-        // Check all candidate names (backend caches under the coin name, not the CDN variant)
+        // 1. Try local disk cache (from IconCacheService)
         let allURLs = [url] + fallbackURLs
         for candidateURL in allURLs {
             let name = candidateURL.deletingPathExtension().lastPathComponent
@@ -236,22 +262,33 @@ private struct SVGIconView: View {
                     SVGIconCache.shared.set(img, for: url)
                     self.image = img
                     loaded = true
+                    #if DEBUG
+                    print("[Icon] DISK HIT: \(fallbackSymbol)")
+                    #endif
                     return
                 }
             }
         }
-        // Also check the base symbol name directly (backend stores under coin name e.g. "HFUN")
-        let iconName = fallbackSymbol
-        if let localData = IconCacheService.shared.svgData(for: iconName) {
+        // Also check the base symbol name directly
+        if let localData = IconCacheService.shared.svgData(for: fallbackSymbol) {
             if let img = Self.renderSVG(data: localData, size: size, symbol: fallbackSymbol) {
                 SVGIconCache.shared.set(img, for: url)
                 self.image = img
                 loaded = true
+                #if DEBUG
+                print("[Icon] DISK HIT (symbol): \(fallbackSymbol)")
+                #endif
                 return
             }
         }
 
-        // 2. Fallback: fetch from CDN directly (try primary URL, then fallback URLs)
+        // 2. CDN fetch with global concurrency limit (max 6 concurrent)
+        await IconFetchLimiter.shared.acquire()
+
+        #if DEBUG
+        print("[Icon] CDN FETCH: \(fallbackSymbol)")
+        #endif
+
         let urlsToTry = [url] + fallbackURLs
         do {
             for tryURL in urlsToTry {
@@ -259,18 +296,22 @@ private struct SVGIconView: View {
                 request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
                 let (data, response) = try await iconSession.data(for: request)
 
-                // Skip HTML error pages (icon doesn't exist on CDN)
                 if data.starts(with: [0x3C, 0x21]) { continue }
                 if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
 
                 if let img = Self.renderSVG(data: data, size: size, symbol: fallbackSymbol) {
                     SVGIconCache.shared.set(img, for: url)
+                    // Persist to disk for next launch
+                    let cdnName = tryURL.deletingPathExtension().lastPathComponent
+                    IconCacheService.shared.saveToDisk(data, for: cdnName)
                     self.image = img
                     break
                 }
             }
             loaded = true
+            await IconFetchLimiter.shared.release()
         } catch {
+            await IconFetchLimiter.shared.release()
             // Timeout / network error — don't mark loaded → retry on next appear
         }
     }

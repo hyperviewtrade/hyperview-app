@@ -341,6 +341,12 @@ struct HomeView: View {
             await sentimentVM.load()
             print("[STARTUP] SENTIMENT LOAD END")
         }
+        .onAppear {
+            twapVM.startHomePressurePolling()
+        }
+        .onDisappear {
+            twapVM.stopHomePressurePolling()
+        }
         } // ScrollViewReader
     }
 

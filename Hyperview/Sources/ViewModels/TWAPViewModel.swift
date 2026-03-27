@@ -172,7 +172,11 @@ final class TWAPViewModel: ObservableObject {
         config.timeoutIntervalForResource = 60
         return URLSession(configuration: config)
     }()
+
+    /// TWAP tab full polling (15s, only while tab visible)
     private var pollTimer: AnyCancellable?
+    /// Home buy pressure polling (12s, only while Home visible)
+    private var homePressureTimer: AnyCancellable?
 
     var filteredOrders: [TWAPOrder] {
         // Exclude unresolved Asset# entries
@@ -219,22 +223,50 @@ final class TWAPViewModel: ObservableObject {
         orders.filter { $0.isActive && !$0.isBuy && (selectedCoin == "All" || $0.coin == selectedCoin) }.count
     }
 
-    // MARK: - Polling
+    // MARK: - Polling (TWAP tab — full fetch every 15s while visible)
 
     func startPolling() {
         guard pollTimer == nil else { return }
-        // Don't fetch here — load() already fetched. Just start the timer.
         pollTimer = Timer.publish(every: 15, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 guard UIApplication.shared.applicationState == .active else { return }
                 Task { await self?.fetch() }
             }
+        print("[TWAP] Tab polling started (15s)")
     }
 
     func stopPolling() {
         pollTimer?.cancel()
         pollTimer = nil
+        print("[TWAP] Tab polling paused")
+    }
+
+    /// Resume TWAP tab — immediate refresh then resume 15s polling.
+    func resumeTabPolling() {
+        Task { await fetch() }
+        startPolling()
+    }
+
+    // MARK: - Home buy pressure polling (12s while Home visible)
+
+    func startHomePressurePolling() {
+        guard homePressureTimer == nil else { return }
+        // Immediate fetch on return
+        Task { await fetchBuyPressure() }
+        homePressureTimer = Timer.publish(every: 12, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                guard UIApplication.shared.applicationState == .active else { return }
+                Task { await self?.fetchBuyPressure() }
+            }
+        print("[TWAP] Home pressure polling started (12s)")
+    }
+
+    func stopHomePressurePolling() {
+        homePressureTimer?.cancel()
+        homePressureTimer = nil
+        print("[TWAP] Home pressure polling paused")
     }
 
     func fetch() async {
@@ -360,7 +392,7 @@ final class TWAPViewModel: ObservableObject {
 
         let elapsed = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
         print("[TWAP] LOAD COMPLETE  orders=\(orders.count) hasLoaded=\(hasLoaded) elapsed=\(elapsed)ms")
-        startPolling()
+        // Don't auto-start polling here — views control their own polling lifecycle
     }
 
     func refresh() async {

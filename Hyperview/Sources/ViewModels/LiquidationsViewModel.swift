@@ -78,44 +78,59 @@ final class LiquidationsViewModel: ObservableObject {
     init() {
         loadNotificationRules()
         notifiedIds = LiquidationNotificationService.shared.loadPersistedNotifiedIds()
-        // Start background polling for notifications (if rules exist)
+        // Start background polling for notifications if rules exist
+        // (APNs push is not yet fully reliable — this is the safety net)
         startBackgroundPollingIfNeeded()
     }
 
     // MARK: - Polling
 
-    /// Fast polling when the Liquidations view is visible (every 15s)
+    /// Poll every 6s while Liquidations screen is visible.
+    /// On return from off-screen: immediate delta fetch, then resume 6s polling.
+    /// Off-screen: slow background polling (45s) ONLY for notification checks if rules exist.
     func startPolling() {
+        let wasVisible = isViewVisible
         isViewVisible = true
         stopBackgroundPolling()
-        guard pollTimer == nil else { return }
-        Task { await fetch() }
-        Task { await fetchAllPerps() }
 
-        pollTimer = Timer.publish(every: 15, on: .main, in: .common)
+        // Immediate delta fetch on every return (catches events missed while away)
+        Task { await fetch() }
+
+        // First time opening — also fetch perp list
+        if !wasVisible && newestTimestamp == 0 {
+            Task { await fetchAllPerps() }
+        }
+
+        guard pollTimer == nil else { return }
+        pollTimer = Timer.publish(every: 6, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 Task { await self?.fetch() }
             }
+        print("[LIQ] Foreground polling started (6s)")
     }
 
-    /// Stop fast polling when leaving the view, resume background polling for notifs
+    /// Stop foreground polling when leaving the screen.
+    /// Resumes slow background polling if notification rules exist.
     func stopPolling() {
         isViewVisible = false
         pollTimer?.cancel()
         pollTimer = nil
         startBackgroundPollingIfNeeded()
+        print("[LIQ] Foreground polling paused")
     }
 
-    /// Background polling (every 30s) for notification checks — battery-friendly
+    /// Background polling (45s) for notification checks — safety net while APNs push
+    /// is not yet fully reliable. Only runs when rules exist and view is hidden.
     private func startBackgroundPollingIfNeeded() {
         guard backgroundPollTimer == nil, !notificationRules.isEmpty else { return }
-        backgroundPollTimer = Timer.publish(every: 30, on: .main, in: .common)
+        backgroundPollTimer = Timer.publish(every: 45, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 guard let self, !self.isViewVisible else { return }
                 Task { await self.fetch() }
             }
+        print("[LIQ] Background polling started (45s, notification safety net)")
     }
 
     private func stopBackgroundPolling() {

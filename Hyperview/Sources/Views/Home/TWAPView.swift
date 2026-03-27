@@ -249,6 +249,7 @@ struct TWAPView: View {
         }
         .background(Color.hlBackground.ignoresSafeArea())
         .task { await vm.load() }
+        .onAppear { vm.resumeTabPolling() }
         .onDisappear { vm.stopPolling() }
         .onReceive(progressTimer) { _ in
             progressTick.toggle()

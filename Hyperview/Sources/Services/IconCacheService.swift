@@ -29,6 +29,7 @@ final class IconCacheService {
 
     /// Returns cached SVG data for a symbol, or nil if not cached yet.
     /// Non-blocking — returns immediately from memory/disk cache.
+    /// Accepts both CDN names ("GOLD") and HIP-3 symbols ("xyz:GOLD").
     func svgData(for symbol: String) -> Data? {
         // 1. Memory cache (fastest)
         lock.lock()
@@ -38,13 +39,24 @@ final class IconCacheService {
         }
         lock.unlock()
 
-        // 2. Disk cache
+        // 2. Disk cache (sanitized filename)
         let file = fileURL(for: symbol)
         if let data = FileManager.default.contents(atPath: file.path) {
             lock.lock()
             memoryCache[symbol] = data
             lock.unlock()
             return data
+        }
+
+        // 3. Try percent-decoded variant (CDN URL-encodes colons)
+        let decoded = symbol.removingPercentEncoding ?? symbol
+        if decoded != symbol {
+            lock.lock()
+            if let data = memoryCache[decoded] {
+                lock.unlock()
+                return data
+            }
+            lock.unlock()
         }
 
         return nil
@@ -90,6 +102,15 @@ final class IconCacheService {
         lock.unlock()
 
         return result
+    }
+
+    /// Save SVG data to disk cache (called from SVGIconView after CDN fetch).
+    func saveToDisk(_ data: Data, for symbol: String) {
+        let file = fileURL(for: symbol)
+        try? data.write(to: file)
+        lock.lock()
+        memoryCache[symbol] = data
+        lock.unlock()
     }
 
     // MARK: - Private
@@ -148,7 +169,9 @@ final class IconCacheService {
         return [symbol]
     }
 
-    /// Preload existing disk cache into memory for fast access
+    /// Preload existing disk cache into memory for fast access.
+    /// Stores under BOTH the sanitized filename (CDN lookup name) and the
+    /// colon-restored name (HIP-3 symbol lookup), so either key hits memory.
     private func preloadMemoryCache() async {
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path) else { return }
 
@@ -156,18 +179,20 @@ final class IconCacheService {
         for file in files where file.hasSuffix(".svg") {
             let path = cacheDir.appendingPathComponent(file).path
             if let data = FileManager.default.contents(atPath: path) {
-                // Reverse the filename sanitization: "xyz_GOLD.svg" → "xyz:GOLD"
-                let symbol = String(file.dropLast(4)) // remove .svg
-                    .replacingOccurrences(of: "_", with: ":")
+                let baseName = String(file.dropLast(4)) // remove .svg
                 lock.lock()
-                memoryCache[symbol] = data
+                // Store under the exact filename (matches CDN URL last path component)
+                memoryCache[baseName] = data
+                // Also store under colon-restored name for HIP-3 lookups
+                if baseName.contains("_") {
+                    let colonName = baseName.replacingOccurrences(of: "_", with: ":")
+                    memoryCache[colonName] = data
+                }
                 lock.unlock()
                 loaded += 1
             }
         }
 
-        #if DEBUG
         print("[IconCache] Preloaded \(loaded) icons from disk")
-        #endif
     }
 }
