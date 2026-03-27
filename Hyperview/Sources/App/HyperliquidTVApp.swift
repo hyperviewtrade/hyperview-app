@@ -72,14 +72,23 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 
     // MARK: - Notification Handling
 
-    /// Called when user taps a notification -> navigate to wallet detail.
+    /// Called when user taps a notification -> navigate to Liquidations section.
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
                                             didReceive response: UNNotificationResponse) async {
         let userInfo = response.notification.request.content.userInfo
-        guard let address = userInfo["walletAddress"] as? String else { return }
+        let notifType = userInfo["type"] as? String
+
         await MainActor.run {
-            AppState.shared.selectedTab = 0
-            AppState.shared.pendingWalletAddress = address
+            if notifType == "liquidation" {
+                // Navigate to Home tab → Liquidations section
+                AppState.shared.selectedTab = 0
+                AppState.shared.pendingLiquidationOpen = true
+                print("[LIQ NOTIFICATION TAP] type=liquidation, navigating to Liquidations")
+            } else if let address = userInfo["walletAddress"] as? String {
+                // Fallback: open wallet detail
+                AppState.shared.selectedTab = 0
+                AppState.shared.pendingWalletAddress = address
+            }
         }
     }
 

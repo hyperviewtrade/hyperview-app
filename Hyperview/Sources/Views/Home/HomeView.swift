@@ -70,14 +70,20 @@ struct HomeView: View {
             HomeSettingsSheet()
         }
         .task {
+            print("[STARTUP] HOME APPEAR t=\(Int(Date().timeIntervalSince1970 * 1000))")
             // Start feed immediately — don't block on markets loading
             if !marketsVM.markets.isEmpty {
                 vm.start(markets: marketsVM.markets)
             }
-            // Load aliases in background (non-blocking)
-            Task { await loadGlobalAliases() }
-            // Pre-fetch leaderboard + whale positions in background
-            Task.detached(priority: .userInitiated) {
+            // Defer non-critical background fetches to reduce startup request storm
+            Task {
+                try? await Task.sleep(for: .seconds(3))
+                print("[STARTUP] ALIASES LOAD START (deferred 3s)")
+                await loadGlobalAliases()
+            }
+            Task.detached(priority: .utility) {
+                try? await Task.sleep(for: .seconds(4))
+                print("[STARTUP] LEADERBOARD+WHALES LOAD START (deferred 4s)")
                 await LeaderboardViewModel.shared.load()
                 await LargestPositionsViewModel.shared.load()
             }
@@ -147,6 +153,19 @@ struct HomeView: View {
                 notifWalletAddress = address
                 showNotifWallet = true
                 appState.pendingWalletAddress = nil
+            }
+        }
+        .onChange(of: appState.pendingLiquidationOpen) { _, open in
+            if open {
+                vm.selectedFilter = .liquidations
+                appState.pendingLiquidationOpen = false
+            }
+        }
+        .onAppear {
+            // Handle notification tap on cold start (onChange won't fire if already set)
+            if appState.pendingLiquidationOpen {
+                vm.selectedFilter = .liquidations
+                appState.pendingLiquidationOpen = false
             }
         }
         .onChange(of: appState.pendingPositionCoin) { _, coin in
@@ -309,18 +328,18 @@ struct HomeView: View {
             await earnVM.load()
         }
         .task {
-            // Fast path: fetch HYPE buy pressure immediately for Home card
-            // This is independent of full TWAP list loading
-            await twapVM.fetchBuyPressure()
-        }
-        .task {
-            // Full TWAP load (slower — asset map + Hypurrscan) for TWAP tab
+            print("[STARTUP] TWAP LOAD START t=\(Int(Date().timeIntervalSince1970 * 1000))")
             if !twapVM.hasLoaded {
                 await twapVM.load()
             }
+            print("[STARTUP] TWAP LOAD END t=\(Int(Date().timeIntervalSince1970 * 1000))")
         }
         .task {
+            // Defer sentiment — not above-the-fold, let critical data load first
+            try? await Task.sleep(for: .seconds(2))
+            print("[STARTUP] SENTIMENT LOAD START (deferred 2s)")
             await sentimentVM.load()
+            print("[STARTUP] SENTIMENT LOAD END")
         }
         } // ScrollViewReader
     }

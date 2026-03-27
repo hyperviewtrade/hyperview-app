@@ -1,17 +1,24 @@
 import Foundation
 
-/// Downloads all coin SVG icons from the backend in a single request,
-/// then stores them on disk for instant local access.
-/// Icons never change → one download, always cached.
+/// Coin icon cache — loads SVGs directly from Hyperliquid CDN on demand,
+/// caches to disk for instant subsequent access.
 ///
-/// First launch: icons load from CDN normally, bundle downloads in background.
-/// Second launch+: icons load from disk cache, instant.
+/// Zero backend egress: icons come straight from HL CDN.
+/// Lazy loading: only downloads icons for coins the user actually views.
+/// Persistent cache: survives app restarts, never re-downloads an icon.
 final class IconCacheService {
     static let shared = IconCacheService()
 
-    private let backendURL = "\(Configuration.backendBaseURL)/icons"
+    private static let cdnBase = "https://app.hyperliquid.xyz/coins"
     private let cacheDir: URL
     private let metaFile: URL
+
+    /// In-memory cache of already-loaded SVG data (avoids disk reads)
+    private var memoryCache: [String: Data] = [:]
+    private let lock = NSLock()
+
+    /// Track in-flight downloads to avoid duplicates
+    private var inFlight: [String: Task<Data?, Never>] = [:]
 
     private init() {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -20,77 +27,147 @@ final class IconCacheService {
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
     }
 
-    /// Returns cached SVG data for a symbol, or nil if not cached.
+    /// Returns cached SVG data for a symbol, or nil if not cached yet.
+    /// Non-blocking — returns immediately from memory/disk cache.
     func svgData(for symbol: String) -> Data? {
-        let file = cacheDir.appendingPathComponent("\(symbol).svg")
-        return FileManager.default.contents(atPath: file.path)
+        // 1. Memory cache (fastest)
+        lock.lock()
+        if let data = memoryCache[symbol] {
+            lock.unlock()
+            return data
+        }
+        lock.unlock()
+
+        // 2. Disk cache
+        let file = fileURL(for: symbol)
+        if let data = FileManager.default.contents(atPath: file.path) {
+            lock.lock()
+            memoryCache[symbol] = data
+            lock.unlock()
+            return data
+        }
+
+        return nil
     }
 
     /// True if the icon bundle has been downloaded at least once.
     var hasCachedIcons: Bool {
-        FileManager.default.fileExists(atPath: metaFile.path)
+        // Check if cache directory has any .svg files
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)) ?? []
+        return contents.contains(where: { $0.hasSuffix(".svg") })
     }
 
-    /// Call on app launch. NEVER blocks UI.
-    /// First launch: fires background download, icons will load from CDN this time.
-    /// Second launch+: icons already on disk, background refresh for new coins only.
+    /// Call on app launch. Preloads disk cache into memory (non-blocking).
     func refreshIfNeeded() {
         Task.detached(priority: .utility) { [weak self] in
-            await self?.downloadBundle()
+            await self?.preloadMemoryCache()
         }
     }
 
-    private func downloadBundle() async {
-        guard let url = URL(string: backendURL) else { return }
+    /// Download a specific icon on demand. Returns SVG data or nil.
+    /// Safe to call from any context — deduplicates concurrent requests.
+    func fetchIcon(for symbol: String) async -> Data? {
+        // Already cached?
+        if let data = svgData(for: symbol) { return data }
 
-        do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 60
-
-            // Send ETag for conditional request
-            if let meta = loadMeta(), let etag = meta["etag"] as? String {
-                request.setValue(etag, forHTTPHeaderField: "If-None-Match")
-            }
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-
-            guard let http = response as? HTTPURLResponse else { return }
-
-            // 304 Not Modified — cache is still valid
-            if http.statusCode == 304 { return }
-            guard http.statusCode == 200 else { return }
-
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let icons = json["icons"] as? [String: String] else { return }
-
-            // Write each SVG to disk
-            for (symbol, svg) in icons {
-                let file = cacheDir.appendingPathComponent("\(symbol).svg")
-                try? svg.data(using: .utf8)?.write(to: file)
-            }
-
-            // Save metadata
-            let etag = http.value(forHTTPHeaderField: "ETag") ?? ""
-            let meta: [String: Any] = [
-                "etag": etag,
-                "count": icons.count,
-                "downloadedAt": ISO8601DateFormatter().string(from: Date()),
-            ]
-            try? JSONSerialization.data(withJSONObject: meta)
-                .write(to: metaFile)
-
-            #if DEBUG
-            print("[IconCache] \(icons.count) icons cached to disk")
-            #endif
-        } catch {
-            #if DEBUG
-            print("[IconCache] Download failed: \(error.localizedDescription)")
-            #endif
+        // Already downloading?
+        lock.lock()
+        if let existing = inFlight[symbol] {
+            lock.unlock()
+            return await existing.value
         }
+
+        let task = Task<Data?, Never> {
+            await self.downloadIcon(symbol)
+        }
+        inFlight[symbol] = task
+        lock.unlock()
+
+        let result = await task.value
+
+        lock.lock()
+        inFlight.removeValue(forKey: symbol)
+        lock.unlock()
+
+        return result
     }
 
-    private func loadMeta() -> [String: Any]? {
-        guard let data = FileManager.default.contents(atPath: metaFile.path) else { return nil }
-        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    // MARK: - Private
+
+    private func fileURL(for symbol: String) -> URL {
+        // Sanitize symbol for filesystem (e.g. "xyz:GOLD" → "xyz_GOLD.svg")
+        let safe = symbol.replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+        return cacheDir.appendingPathComponent("\(safe).svg")
+    }
+
+    /// Download a single icon from HL CDN
+    private func downloadIcon(_ symbol: String) async -> Data? {
+        // For HIP-3 symbols like "xyz:GOLD", try the base name first
+        let candidates = iconCandidates(for: symbol)
+
+        for candidate in candidates {
+            let encoded = candidate.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? candidate
+            guard let url = URL(string: "\(Self.cdnBase)/\(encoded).svg") else { continue }
+
+            do {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 10
+                let (data, response) = try await URLSession.shared.data(for: request)
+
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { continue }
+
+                // Validate it's actually an SVG
+                guard let text = String(data: data, encoding: .utf8),
+                      text.contains("<svg") else { continue }
+
+                // Cache to disk and memory
+                let file = fileURL(for: symbol)
+                try? data.write(to: file)
+
+                lock.lock()
+                memoryCache[symbol] = data
+                lock.unlock()
+
+                return data
+            } catch {
+                continue
+            }
+        }
+
+        return nil
+    }
+
+    /// Generate candidate icon names for a symbol
+    private func iconCandidates(for symbol: String) -> [String] {
+        // HIP-3: "xyz:GOLD" → try "GOLD", then "xyz:GOLD"
+        if let colonIdx = symbol.firstIndex(of: ":") {
+            let base = String(symbol[symbol.index(after: colonIdx)...])
+            return [base, symbol]
+        }
+        return [symbol]
+    }
+
+    /// Preload existing disk cache into memory for fast access
+    private func preloadMemoryCache() async {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path) else { return }
+
+        var loaded = 0
+        for file in files where file.hasSuffix(".svg") {
+            let path = cacheDir.appendingPathComponent(file).path
+            if let data = FileManager.default.contents(atPath: path) {
+                // Reverse the filename sanitization: "xyz_GOLD.svg" → "xyz:GOLD"
+                let symbol = String(file.dropLast(4)) // remove .svg
+                    .replacingOccurrences(of: "_", with: ":")
+                lock.lock()
+                memoryCache[symbol] = data
+                lock.unlock()
+                loaded += 1
+            }
+        }
+
+        #if DEBUG
+        print("[IconCache] Preloaded \(loaded) icons from disk")
+        #endif
     }
 }

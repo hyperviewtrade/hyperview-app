@@ -78,7 +78,12 @@ final class LiquidationNotificationService {
         content.title = "\(liq.coin) \(liq.side) Liquidation"
         content.body = "\(liq.formattedSize) liquidated @ \(liq.formattedPrice)"
         content.sound = .default
-        content.userInfo = ["walletAddress": liq.address, "type": "liquidation"]
+        content.userInfo = [
+            "walletAddress": liq.address,
+            "type": "liquidation",
+            "liquidationId": liq.id,
+            "coin": liq.coin,
+        ]
 
         let request = UNNotificationRequest(
             identifier: "liq-\(liq.id)",

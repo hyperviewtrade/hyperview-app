@@ -166,6 +166,12 @@ final class TWAPViewModel: ObservableObject {
     @Published var hypePressure24hUSD: Double = 0
 
     private static let backendBase = "https://hyperview-backend-production-075c.up.railway.app"
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        return URLSession(configuration: config)
+    }()
     private var pollTimer: AnyCancellable?
 
     var filteredOrders: [TWAPOrder] {
@@ -234,68 +240,94 @@ final class TWAPViewModel: ObservableObject {
     func fetch() async {
         let urlStr = "\(Self.backendBase)/twaps?activeOnly=true&limit=1000"
         let t0 = CFAbsoluteTimeGetCurrent()
-        print("[TWAP] FETCH START  hasLoaded=\(hasLoaded) orders=\(orders.count)")
+        print("[TWAP] FETCH START  hasLoaded=\(hasLoaded) orders=\(orders.count) t=\(Int(Date().timeIntervalSince1970 * 1000))")
 
+        // Run in a non-cancellable context so SwiftUI .task lifecycle doesn't abort in-flight requests
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            Task.detached { [weak self] in
+                guard let self else { cont.resume(); return }
+
+                do {
+                    guard let url = URL(string: urlStr) else { await MainActor.run { cont.resume() }; return }
+
+                    // Fetch TWAP list and buy pressure concurrently
+                    async let twapData = Self.session.data(from: url)
+                    async let pressureTask: Void = self.fetchBuyPressureDetached()
+
+                    let (data, response) = try await twapData
+
+                    if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 503 {
+                        print("[TWAP] BACKEND NOT READY (503) — will retry")
+                        _ = await pressureTask
+                        await MainActor.run { cont.resume() }
+                        return
+                    }
+
+                    let parsed = Self.parseResponse(data)
+                    _ = await pressureTask
+
+                    await MainActor.run {
+                        self.orders = parsed.orders
+                        self.hasLoaded = true
+                        self.errorMsg = nil
+                        let activeCount = self.orders.filter { $0.isActive }.count
+                        let elapsed = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+                        print("[TWAP] FETCH SUCCESS  count=\(self.orders.count) active=\(activeCount) elapsed=\(elapsed)ms")
+
+                        let filteredCoins = parsed.coins.filter { !$0.hasPrefix("Asset#") }
+                        if filteredCoins != self.availableCoins {
+                            self.availableCoins = filteredCoins
+                        }
+
+                        if self.isLoading {
+                            self.progressText = nil
+                            self.isLoading = false
+                        }
+                        cont.resume()
+                    }
+                } catch {
+                    let desc = error.localizedDescription
+                    print("[TWAP] FETCH FAILURE  error=\(desc) staleOrders=\(await self.orders.count)")
+                    await MainActor.run {
+                        // Don't show "cancelled" as an error — it's a transient state
+                        if self.orders.isEmpty && !self.hasLoaded && !desc.contains("cancelled") {
+                            self.errorMsg = desc
+                        }
+                        if self.isLoading {
+                            self.progressText = nil
+                            self.isLoading = false
+                        }
+                        cont.resume()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Non-isolated buy pressure fetch (safe to call from detached task)
+    nonisolated func fetchBuyPressureDetached() async {
+        guard let url = URL(string: "\(Self.backendBase)/twap-pressure?coin=HYPE") else { return }
         do {
-            guard let url = URL(string: urlStr) else { return }
-
-            // Fetch TWAP list and buy pressure CONCURRENTLY (saves ~1.5s)
-            async let twapData = URLSession.shared.data(from: url)
-            async let pressureTask: Void = fetchBuyPressure()
-
-            let (data, response) = try await twapData
-
-            // If backend returns 503 (tracker not ready), keep loading state
-            if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 503 {
-                print("[TWAP] BACKEND NOT READY (503) — will retry")
-                _ = await pressureTask
-                return
+            let (data, _) = try await Self.session.data(from: url)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let p1h = (json["next1hUSD"] as? NSNumber)?.doubleValue ?? 0
+                let p24h = (json["next24hUSD"] as? NSNumber)?.doubleValue ?? 0
+                await MainActor.run { [weak self] in
+                    self?.hypePressure1hUSD = p1h
+                    self?.hypePressure24hUSD = p24h
+                    print("[TWAP] BUY PRESSURE: 1h=$\(p1h) 24h=$\(p24h)")
+                }
             }
-
-            let parsed = await Task.detached(priority: .userInitiated) {
-                Self.parseResponse(data)
-            }.value
-
-            // Update orders (never clear to empty on success — server returns current state)
-            orders = parsed.orders
-            hasLoaded = true
-            errorMsg = nil
-            let activeCount = orders.filter { $0.isActive }.count
-            let elapsed = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            print("[TWAP] FETCH SUCCESS  count=\(orders.count) active=\(activeCount) filteredOrders=\(filteredOrders.count) elapsed=\(elapsed)ms")
-
-            // Only update coin list if it actually changed (prevents Menu reset during scroll)
-            let filteredCoins = parsed.coins.filter { !$0.hasPrefix("Asset#") }
-            if filteredCoins != availableCoins {
-                availableCoins = filteredCoins
-            }
-
-            if isLoading {
-                progressText = nil
-                isLoading = false
-            }
-
-            // Wait for concurrent pressure fetch to complete
-            _ = await pressureTask
         } catch {
-            print("[TWAP] FETCH FAILURE  error=\(error.localizedDescription) staleOrders=\(orders.count)")
-            // Only set errorMsg if we have NO stale data to show
-            if orders.isEmpty {
-                errorMsg = error.localizedDescription
-            }
-            if isLoading {
-                progressText = nil
-                isLoading = false
-            }
+            print("[TWAP] BUY PRESSURE FETCH FAILURE: \(error.localizedDescription)")
         }
     }
 
     func fetchBuyPressure() async {
         guard let url = URL(string: "\(Self.backendBase)/twap-pressure?coin=HYPE") else { return }
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await Self.session.data(from: url)
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                // Handle both Int and Double from JSON (JSONSerialization may return Int for whole numbers)
                 hypePressure1hUSD = (json["next1hUSD"] as? NSNumber)?.doubleValue ?? 0
                 hypePressure24hUSD = (json["next24hUSD"] as? NSNumber)?.doubleValue ?? 0
                 print("[TWAP] BUY PRESSURE: 1h=$\(hypePressure1hUSD) 24h=$\(hypePressure24hUSD)")

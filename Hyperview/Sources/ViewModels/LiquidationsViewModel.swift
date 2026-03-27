@@ -53,7 +53,7 @@ final class LiquidationsViewModel: ObservableObject {
     @Published var perpVolumes: [String: Double] = [:]
     @Published var selectedCoins: Set<String> = []   // empty = All markets
     @Published var selectedSide: String = "All"
-    @Published var minSize: String = "1,000"
+    @Published var minSize: String = ""
     @Published var maxSize: String = ""
     @Published var isLoading = false
     @Published var isLoadingMore = false
@@ -72,6 +72,8 @@ final class LiquidationsViewModel: ObservableObject {
     private var isViewVisible = false
     /// Timestamp of newest liquidation — used for delta polling (since=)
     private var newestTimestamp: Double = 0
+    /// Liquidations that triggered notifications — merged into list when view opens
+    private var pendingNotifiedItems: [LiquidationItem] = []
 
     init() {
         loadNotificationRules()
@@ -174,11 +176,11 @@ final class LiquidationsViewModel: ObservableObject {
     }
 
     /// First page load — replaces the list, resets pagination state.
-    private func fetchFirstPage() async {
+    func fetchFirstPage() async {
         newestTimestamp = 0
         var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
         var queryItems = filterQueryItems()
-        queryItems.append(URLQueryItem(name: "limit", value: "30"))
+        queryItems.append(URLQueryItem(name: "limit", value: "50"))
         components.queryItems = queryItems
         guard let url = components.url else { return }
 
@@ -189,8 +191,23 @@ final class LiquidationsViewModel: ObservableObject {
 
             checkNotifications(response.liquidations)
             // Backend returns sorted newest-first, but verify
-            liquidations = response.liquidations.sorted { $0.timestamp > $1.timestamp }
-            totalFiltered = response.total ?? response.liquidations.count
+            var merged = response.liquidations
+
+            // Merge in any notified items that aren't in the response
+            // (they may be beyond the first page but the user expects to see them)
+            if !pendingNotifiedItems.isEmpty {
+                let responseIds = Set(merged.map(\.id))
+                let missing = pendingNotifiedItems.filter { !responseIds.contains($0.id) }
+                if !missing.isEmpty {
+                    merged.append(contentsOf: missing)
+                    print("[LIQ] MERGED \(missing.count) notified items into first page")
+                }
+                // Clear pending — they're now in the list
+                pendingNotifiedItems.removeAll()
+            }
+
+            liquidations = merged.sorted { $0.timestamp > $1.timestamp }
+            totalFiltered = max(response.total ?? response.liquidations.count, liquidations.count)
 
             if let newest = liquidations.first?.timestamp {
                 newestTimestamp = newest
@@ -199,10 +216,7 @@ final class LiquidationsViewModel: ObservableObject {
                 availableCoins = ["All"] + coins
             }
 
-            let firstTs = liquidations.first?.timestamp ?? 0
-            let lastTs = liquidations.last?.timestamp ?? 0
-            let isSorted = zip(liquidations, liquidations.dropFirst()).allSatisfy { $0.timestamp >= $1.timestamp }
-            print("[LIQ] FIRST PAGE: count=\(liquidations.count) total=\(totalFiltered) firstTS=\(Int64(firstTs)) lastTS=\(Int64(lastTs)) sorted=\(isSorted)")
+            print("[LIQ] FIRST PAGE: count=\(liquidations.count) total=\(totalFiltered)")
         } catch {
             print("[LIQ] FIRST PAGE DECODE ERROR: \(error)")
         }
@@ -230,15 +244,28 @@ final class LiquidationsViewModel: ObservableObject {
 
             checkNotifications(response.liquidations)
 
-            if !response.liquidations.isEmpty {
-                // Merge new items, dedup by id, re-sort globally newest-first
-                let existingIds = Set(liquidations.map(\.id))
-                let fresh = response.liquidations.filter { !existingIds.contains($0.id) }
-                if !fresh.isEmpty {
-                    liquidations = (fresh + liquidations).sorted { $0.timestamp > $1.timestamp }
-                    totalFiltered += fresh.count
-                    print("[LIQ] DELTA: +\(fresh.count) new, total=\(liquidations.count)")
+            // Collect new items from delta + any pending notified items
+            var existingIds = Set(liquidations.map(\.id))
+            var toMerge: [LiquidationItem] = []
+
+            for item in response.liquidations where !existingIds.contains(item.id) {
+                toMerge.append(item)
+                existingIds.insert(item.id)
+            }
+
+            // Also merge pending notified items not yet in the list
+            if isViewVisible, !pendingNotifiedItems.isEmpty {
+                for item in pendingNotifiedItems where !existingIds.contains(item.id) {
+                    toMerge.append(item)
+                    existingIds.insert(item.id)
                 }
+                pendingNotifiedItems.removeAll()
+            }
+
+            if !toMerge.isEmpty {
+                liquidations = (toMerge + liquidations).sorted { $0.timestamp > $1.timestamp }
+                totalFiltered += toMerge.count
+                print("[LIQ] DELTA: +\(toMerge.count) merged, total=\(liquidations.count)")
             }
 
             if let newest = liquidations.first?.timestamp, newest > newestTimestamp {
@@ -267,7 +294,7 @@ final class LiquidationsViewModel: ObservableObject {
         var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
         var queryItems = filterQueryItems()
         queryItems.append(URLQueryItem(name: "before", value: String(Int64(oldestTs))))
-        queryItems.append(URLQueryItem(name: "limit", value: "30"))
+        queryItems.append(URLQueryItem(name: "limit", value: "50"))
         components.queryItems = queryItems
         guard let url = components.url else { return }
 
@@ -306,6 +333,14 @@ final class LiquidationsViewModel: ObservableObject {
             notifiedIds.insert(liq.id)
             if matchesAnyRule(liq) {
                 sendLocalNotification(liq)
+                // Store so it can be surfaced in the list even if beyond first page
+                if !pendingNotifiedItems.contains(where: { $0.id == liq.id }) {
+                    pendingNotifiedItems.append(liq)
+                    // Cap at 50 most recent to avoid unbounded growth
+                    if pendingNotifiedItems.count > 50 {
+                        pendingNotifiedItems.removeFirst()
+                    }
+                }
             }
         }
         if notifiedIds.count > 500 {

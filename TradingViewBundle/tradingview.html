@@ -374,6 +374,9 @@
 
     // Called from Swift to change symbol
     function changeSymbol(symbol, interval, custom) {
+        // Remove stale price line from previous symbol
+        removeLivePriceLine();
+
         // Update custom flag
         isCustomSymbol = !!custom || (symbol && symbol.startsWith('TV:'));
         let actualSymbol = symbol;
@@ -386,6 +389,57 @@
             if (interval) {
                 tvWidget.activeChart().setResolution(interval, function() {});
             }
+        }
+    }
+
+    // ─── Live price line ─────────────────────────────────────
+    var livePriceLine = null;
+    var lastLivePrice = 0;
+
+    function updateLivePrice(price, isUp) {
+        if (!tvWidget || !price || price <= 0) return;
+        try {
+            var chart = tvWidget.activeChart();
+            var series = chart.getSeries && chart.getSeries();
+            if (!series) {
+                // Fallback: use shape-based approach
+                return;
+            }
+
+            var color = isUp ? '#1DB954' : '#E54D42';
+
+            if (livePriceLine) {
+                // Update existing line
+                livePriceLine.setPrice(price);
+                livePriceLine.applyOptions({
+                    color: color,
+                    title: '',
+                });
+            } else {
+                // Create new line
+                livePriceLine = series.createPriceLine({
+                    price: price,
+                    color: color,
+                    lineWidth: 1,
+                    lineStyle: 2, // dashed
+                    axisLabelVisible: true,
+                    title: '',
+                });
+            }
+            lastLivePrice = price;
+        } catch(e) {
+            // Series API may not be available in all TV versions
+        }
+    }
+
+    function removeLivePriceLine() {
+        if (livePriceLine && tvWidget) {
+            try {
+                var series = tvWidget.activeChart().getSeries();
+                if (series) series.removePriceLine(livePriceLine);
+            } catch(e) {}
+            livePriceLine = null;
+            lastLivePrice = 0;
         }
     }
 

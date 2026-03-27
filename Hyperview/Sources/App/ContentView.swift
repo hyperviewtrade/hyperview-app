@@ -12,6 +12,9 @@ final class AppState: ObservableObject {
     /// Wallet address to open when a liquidation notification is tapped.
     @Published var pendingWalletAddress: String?
 
+    /// When true, navigate to the Liquidations section on Home tab
+    @Published var pendingLiquidationOpen: Bool = false
+
     /// Position coin to open from widget deep link
     @Published var pendingPositionCoin: String?
 
@@ -176,10 +179,9 @@ struct ContentView: View {
         // Load markets from the root view — ContentView never disappears,
         // so this Task is never cancelled by tab switching.
         .task { await marketsVM.loadMarkets() }
-        // All non-critical prefetches fire-and-forget — don't hold main actor
+        // Non-critical prefetches — deferred to reduce startup request storm
         .task {
-            // These run concurrently, none blocks the others
-            async let _ = LeaderboardViewModel.shared.load()
+            try? await Task.sleep(for: .seconds(5))
             UnstakingViewModel.shared.prefetch()
             async let _ = RelativePerformanceViewModel.shared.load()
         }

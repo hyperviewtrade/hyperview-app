@@ -5,6 +5,7 @@ struct LiquidationsView: View {
     @State private var showFilters = true
     @ObservedObject private var appState = AppState.shared
 
+    @FocusState private var minSizeFieldFocused: Bool
     @FocusState private var maxSizeFieldFocused: Bool
 
     var body: some View {
@@ -15,11 +16,18 @@ struct LiquidationsView: View {
                 .padding(.vertical, 8)
 
             // ── List ────────────────────────────────────────────
-            if vm.liquidations.isEmpty {
+            if vm.liquidations.isEmpty && vm.isLoading {
                 Spacer()
                 VStack(spacing: 8) {
-                    Text("💥")
-                        .font(.system(size: 40))
+                    ProgressView().tint(.hlGreen).scaleEffect(1.2)
+                    Text("Loading liquidations…")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(white: 0.35))
+                }
+                Spacer()
+            } else if vm.liquidations.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
                     Text("No liquidations yet")
                         .font(.system(size: 14))
                         .foregroundColor(Color(white: 0.5))
@@ -97,6 +105,7 @@ struct LiquidationsView: View {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("Done") {
+                    minSizeFieldFocused = false
                     maxSizeFieldFocused = false
                 }
                 .fontWeight(.semibold)
@@ -198,15 +207,19 @@ struct LiquidationsView: View {
                 }
             }
 
-            // Max size filter (collapsible)
+            // Size filters (collapsible)
             if showFilters {
                 HStack(spacing: 8) {
+                    sizeField("Min $", text: $vm.minSize)
+                        .focused($minSizeFieldFocused)
+
                     sizeField("Max $", text: $vm.maxSize)
                         .focused($maxSizeFieldFocused)
 
                     Button("Apply") {
+                        minSizeFieldFocused = false
                         maxSizeFieldFocused = false
-                        Task { await vm.fetch() }
+                        Task { await vm.fetchFirstPage() }
                     }
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.black)
@@ -221,7 +234,7 @@ struct LiquidationsView: View {
     }
 
     private var hasActiveFilters: Bool {
-        !vm.maxSize.isEmpty
+        !vm.minSize.isEmpty || !vm.maxSize.isEmpty
     }
 
     private func sizeField(_ placeholder: String, text: Binding<String>) -> some View {

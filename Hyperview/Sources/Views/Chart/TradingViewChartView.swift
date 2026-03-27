@@ -83,6 +83,8 @@ struct TradingViewChartView: UIViewRepresentable {
         var currentIsCustom: Bool = false
         var lastRefreshTrigger: Int = 0
         private var candleSub: AnyCancellable?
+        private var livePriceSub: AnyCancellable?
+        private var previousLivePrice: Double = 0
 
         // Track current WS subscription
         private var subscribedSymbol: String?
@@ -182,6 +184,7 @@ struct TradingViewChartView: UIViewRepresentable {
             switch type {
             case "chartReady":
                 isChartReady = true
+                startLivePriceLineUpdates()
 
             case "resolveSymbol":
                 handleResolveSymbol(json, requestId: requestId)
@@ -211,16 +214,47 @@ struct TradingViewChartView: UIViewRepresentable {
             if isCustom {
                 handleResolveSymbolExternal(symbol, requestId: requestId)
             } else {
-                handleResolveSymbolHL(symbol, requestId: requestId)
+                // Run async so we can await prefetched candles for accurate pricescale
+                Task { @MainActor in
+                    await handleResolveSymbolHL(symbol, requestId: requestId)
+                }
             }
         }
 
-        private func handleResolveSymbolHL(_ symbol: String, requestId: Int) {
+        private func handleResolveSymbolHL(_ symbol: String, requestId: Int) async {
             let vm = chartVM
 
-            // Use 5 significant figures for price precision — matches HL display
-            let currentPrice = vm?.livePrice ?? 0
-            let priceDecimals = Market.sigFigDecimals(currentPrice)
+            // Try to get reference price from multiple sources:
+            // 1. ViewModel candles (loaded by loadChart before resolveSymbol)
+            var referencePrice = vm?.candles.last?.close ?? 0
+
+            // 2. Candle cache (filled by prefetchCandles during changeSymbol)
+            if referencePrice == 0 {
+                let interval = vm?.selectedInterval ?? .oneHour
+                let key = "\(symbol):\(interval.rawValue)"
+                referencePrice = Self.candleCache[key]?.candles.last?.close ?? 0
+            }
+
+            // 3. Await in-flight prefetch — this ensures we have accurate data
+            if referencePrice == 0, let prefetch = activePrefetch, prefetch.key.hasPrefix("\(symbol):") {
+                if let candles = try? await prefetch.task.value, let last = candles.last {
+                    referencePrice = last.close
+                }
+            }
+
+            // 4. Live price from WebSocket
+            if referencePrice == 0 {
+                referencePrice = vm?.livePrice ?? 0
+            }
+
+            // Compute pricescale using 5 significant figures — matches header display
+            let priceDecimals: Int
+            if referencePrice > 0 {
+                priceDecimals = Market.sigFigDecimals(referencePrice)
+            } else {
+                // No price available yet — use 2 as safe default
+                priceDecimals = 2
+            }
             let pricescale = Int(pow(10.0, Double(priceDecimals)))
 
             let displayName = vm?.displayName ?? symbol
@@ -230,6 +264,7 @@ struct TradingViewChartView: UIViewRepresentable {
                 "type": "crypto",
                 "pricescale": pricescale
             ]
+            print("[CHART] resolveSymbol \(symbol) refPrice=\(referencePrice) decimals=\(priceDecimals) pricescale=\(pricescale)")
             resolveJSRequest(requestId, data: info)
         }
 
@@ -1371,6 +1406,9 @@ struct TradingViewChartView: UIViewRepresentable {
         // MARK: - Public API
 
         func changeSymbol(_ symbol: String, interval: ChartInterval, isCustom: Bool = false) {
+            // Reset price line for new symbol
+            previousLivePrice = 0
+
             // Prefetch candles immediately — runs in parallel with TV's symbol switch animation
             if !isCustom {
                 prefetchCandles(symbol: symbol, interval: interval)
@@ -1401,6 +1439,31 @@ struct TradingViewChartView: UIViewRepresentable {
             }
             let js = "setChartType(\(tvType));"
             webView?.evaluateJavaScript(js)
+        }
+
+        // MARK: - Live Price Line
+
+        func startLivePriceLineUpdates() {
+            livePriceSub?.cancel()
+            guard let vm = chartVM else { return }
+
+            livePriceSub = vm.$livePrice
+                .receive(on: DispatchQueue.main)
+                .removeDuplicates()
+                .sink { [weak self] price in
+                    guard let self, self.isChartReady, price > 0 else { return }
+                    let isUp = price >= self.previousLivePrice && self.previousLivePrice > 0
+                    self.previousLivePrice = price
+                    let js = "updateLivePrice(\(price), \(isUp));"
+                    self.webView?.evaluateJavaScript(js)
+                }
+        }
+
+        func stopLivePriceLineUpdates() {
+            livePriceSub?.cancel()
+            livePriceSub = nil
+            previousLivePrice = 0
+            webView?.evaluateJavaScript("removeLivePriceLine();")
         }
 
         // MARK: - Helpers
