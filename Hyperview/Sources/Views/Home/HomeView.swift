@@ -309,8 +309,14 @@ struct HomeView: View {
             await earnVM.load()
         }
         .task {
-            if twapVM.orders.isEmpty {
-                await twapVM.refresh()
+            // Fast path: fetch HYPE buy pressure immediately for Home card
+            // This is independent of full TWAP list loading
+            await twapVM.fetchBuyPressure()
+        }
+        .task {
+            // Full TWAP load (slower — asset map + Hypurrscan) for TWAP tab
+            if !twapVM.hasLoaded {
+                await twapVM.load()
             }
         }
         .task {
@@ -879,8 +885,8 @@ struct HomeView: View {
             homeBuyPressureCard
                 .padding(.horizontal, 14)
                 .task {
-                    if twapVM.orders.isEmpty {
-                        await twapVM.refresh()
+                    if !twapVM.hasLoaded {
+                        await twapVM.load()
                     }
                 }
         case "buyback":

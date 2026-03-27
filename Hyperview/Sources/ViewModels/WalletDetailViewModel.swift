@@ -339,6 +339,30 @@ final class WalletDetailViewModel: ObservableObject {
 
     private static let backendBaseURL = "https://hyperview-backend-production-075c.up.railway.app"
 
+    /// Called by background prefetch tasks after all data is parsed.
+    /// Sets isLoading=false and writes the in-memory cache.
+    private func finishLoading(cacheKey: String) {
+        isLoading = false
+        print("⏱ [\(elapsed())] WALLET LOAD COMPLETE  isLoading=false")
+
+        // Cache the loaded data (only if we got meaningful data)
+        if !spotBalances.isEmpty || !positions.isEmpty || !fills.isEmpty {
+            Self.walletCache[cacheKey] = CachedWallet(
+                positions: positions, openOrders: openOrders,
+                spotBalances: spotBalances, fills: fills,
+                transactions: transactions, staking: staking,
+                totalPnl: totalPnl, winrate: winrate,
+                totalVolume: totalVolume, bestTrade: bestTrade,
+                alias: alias, date: Date()
+            )
+            if Self.walletCache.count > Self.maxCacheSize {
+                if let oldest = Self.walletCache.min(by: { $0.value.date < $1.value.date }) {
+                    Self.walletCache.removeValue(forKey: oldest.key)
+                }
+            }
+        }
+    }
+
     /// Shared timing origin for the current load cycle.
     private var loadT0: CFAbsoluteTime = 0
 
@@ -384,14 +408,38 @@ final class WalletDetailViewModel: ObservableObject {
         async let aliasTask: () = resolveAlias(for: address)
 
         do {
-            // Try backend aggregate endpoint first (1 request instead of 7)
-            print("⏱ [\(elapsed())] WALLET TRYING BACKEND")
-            let didLoadFromBackend = await loadFromBackend(address: address)
+            // ── Race strategy: backend vs direct HL API ──
+            // Both paths start in parallel. Whichever sets hasFetched = true first wins.
+            // The loser checks `hasFetched` before mutating state (race guard).
+            // The loser's Task is cancelled so its network calls abort promptly.
+            print("⏱ [\(elapsed())] WALLET RACE START (backend + HL API in parallel)")
 
-            if !didLoadFromBackend {
-                // Fallback: progressive HL API loading
-                print("⏱ [\(elapsed())] WALLET BACKEND FAILED — falling back to HL API")
-                await loadFromHLAPI(address: address)
+            // Path A: backend aggregate endpoint (Task inherits @MainActor)
+            let backendTask = Task { [weak self] () -> Bool in
+                guard let self else { return false }
+                return await self.loadFromBackend(address: address)
+            }
+
+            // Path B: direct HL API — starts immediately, no waiting for backend
+            let hlapiTask = Task { [weak self] in
+                guard let self else { return }
+                await self.loadFromHLAPI(address: address)
+            }
+
+            // Wait for backend to finish first (it has a 1.5s timeout, so it resolves quickly)
+            let backendOK = await backendTask.value
+
+            if backendOK {
+                // Backend won — cancel the HL API path
+                print("⏱ [\(elapsed())] 🏆 BACKEND WON THE RACE")
+                hlapiTask.cancel()
+            } else {
+                // Backend failed — HL API is already running, just wait for it
+                print("⏱ [\(elapsed())] BACKEND LOST — waiting for HL API")
+                await hlapiTask.value
+                if hasFetched {
+                    print("⏱ [\(elapsed())] 🏆 HL API WON (backend failed)")
+                }
             }
         } catch is CancellationError {
             // Dismiss or navigation — ignore
@@ -403,25 +451,13 @@ final class WalletDetailViewModel: ObservableObject {
 
         _ = await tokenNamesTask
         _ = await aliasTask
-        isLoading = false
-        print("⏱ [\(elapsed())] WALLET LOAD COMPLETE  isLoading=false")
-
-        // Cache the loaded data (only if we got meaningful data)
-        if !spotBalances.isEmpty || !positions.isEmpty || !fills.isEmpty {
-            Self.walletCache[cacheKey] = CachedWallet(
-                positions: positions, openOrders: openOrders,
-                spotBalances: spotBalances, fills: fills,
-                transactions: transactions, staking: staking,
-                totalPnl: totalPnl, winrate: winrate,
-                totalVolume: totalVolume, bestTrade: bestTrade,
-                alias: alias, date: Date()
-            )
-            // Evict oldest entry if cache exceeds size limit (HIGH-07)
-            if Self.walletCache.count > Self.maxCacheSize {
-                if let oldest = Self.walletCache.min(by: { $0.value.date < $1.value.date }) {
-                    Self.walletCache.removeValue(forKey: oldest.key)
-                }
-            }
+        // isLoading is set to false by the background prefetch Tasks
+        // (both paths launch a Task that calls finishLoading).
+        // Safety fallback: if no background task was launched (error/cancellation),
+        // ensure isLoading doesn't stay stuck.
+        if errorMsg != nil || !hasFetched {
+            isLoading = false
+            print("⏱ [\(elapsed())] WALLET LOAD FALLBACK — isLoading=false (error or not fetched)")
         }
 
         // Auto-retry if spot is empty but account should have data
@@ -487,7 +523,16 @@ final class WalletDetailViewModel: ObservableObject {
                 self.alias = AliasCache.shared.alias(for: address)
             }
 
-            // ── Phase 1: above-the-fold (positions, orders) ──
+            // ── Phase 1: above-the-fold (positions only) ──
+            // Positions + HIP-3 are the minimum to flip hasData and show the wallet.
+            // Everything else (orders, fills, spot, overview) loads in Phase 2.
+
+            // Race guard: if the HL API path already won, abort — don't overwrite state.
+            guard !hasFetched else {
+                print("⏱ [\(elapsed())] BACKEND ABORTED — HL API already won")
+                return false
+            }
+
             print("⏱ [\(elapsed())] MIDPRICES FETCH START (async)")
             async let midPriceTask: () = fetchMidPrices()
 
@@ -496,55 +541,41 @@ final class WalletDetailViewModel: ObservableObject {
             print("⏱ [\(elapsed())] PARSE POSITIONS END  count=\(positions.count)")
 
             if let hip3 = json["hip3States"] as? [String: [String: Any]] {
-                print("⏱ [\(elapsed())] PARSE HIP3 START  keys=\(hip3.count)")
-                for (_, dexState) in hip3 {
-                    parseHIP3Positions(from: dexState)
-                }
-                print("⏱ [\(elapsed())] PARSE HIP3 END")
+                for (_, dexState) in hip3 { parseHIP3Positions(from: dexState) }
+                print("⏱ [\(elapsed())] PARSE HIP3 END  count=\(positions.count)")
             }
 
-            print("⏱ [\(elapsed())] PARSE ORDERS START")
-            parseOrders(from: state)
-            print("⏱ [\(elapsed())] PARSE ORDERS END  count=\(openOrders.count)")
-
-            hasFetched = true  // UI renders NOW — positions + orders visible
+            hasFetched = true  // UI renders NOW — positions visible
             print("⏱ [\(elapsed())] ✅ hasFetched = true (UI can render)")
 
-            // ── Phase 2a: transactions (pure CPU, no network dependency) ──
-            // Parse fills + transactions immediately so the Transactions tab
-            // is ready by the time the user taps it. No need to wait for midprices.
-            print("⏱ [\(elapsed())] PARSE FILLS START  raw=\(rawFills.count)")
-            parseFills(rawFills)
-            print("⏱ [\(elapsed())] PARSE FILLS END  count=\(fills.count)")
-
-            print("⏱ [\(elapsed())] PARSE TRANSACTIONS START  raw=\(ledger.count)")
-            parseTransactions(ledger)
-            print("⏱ [\(elapsed())] PARSE TRANSACTIONS END  count=\(transactions.count)")
-
-            print("⏱ [\(elapsed())] MERGE FILLS INTO TX START")
-            mergeFillsIntoTransactions()
-            print("⏱ [\(elapsed())] MERGE FILLS INTO TX END  total=\(transactions.count)")
-
-            print("⏱ [\(elapsed())] COMPUTE OVERVIEW START")
-            computeOverview()
-            print("⏱ [\(elapsed())] COMPUTE OVERVIEW END")
-
-            // ── Phase 2b: spot (needs midprices network call) ──
-            print("⏱ [\(elapsed())] MIDPRICES AWAIT START")
+            // ── Phase 2: background prefetch (separate Task, never blocks render) ──
+            // First yield after hasFetched=true lets SwiftUI render the wallet.
+            // Midprices started in parallel, so this await is typically near-zero.
             await midPriceTask
-            print("⏱ [\(elapsed())] MIDPRICES AWAIT END")
 
-            print("⏱ [\(elapsed())] PARSE SPOT START")
-            parseSpot(spot)
-            print("⏱ [\(elapsed())] PARSE SPOT END  count=\(spotBalances.count)")
+            let capturedState = state
+            let capturedRawFills = rawFills
+            let capturedLedger = ledger
+            let capturedSpot = spot
+            let capturedStakeSum = stakeSum
+            let capturedDelegs = delegs
+            let capturedRewards = rewards
+            let capturedAddress = address
+            Task { [weak self] in
+                guard let self else { return }
+                print("⏱ [\(self.elapsed())] BG PHASE2 START")
 
-            print("⏱ [\(elapsed())] PARSE STAKING START")
-            parseStaking(summary: stakeSum, delegations: delegs, rewards: rewards)
-            print("⏱ [\(elapsed())] PARSE STAKING END")
+                self.parseOrders(from: capturedState)
+                self.parseSpot(capturedSpot)
+                self.parseFills(capturedRawFills)
+                self.parseTransactions(capturedLedger)
+                self.mergeFillsIntoTransactions()
+                self.computeOverview()
+                self.parseStaking(summary: capturedStakeSum, delegations: capturedDelegs, rewards: capturedRewards)
 
-            // Older fills are now loaded on demand via "Load More" button
-            // (no automatic background pagination)
-            print("⏱ [\(elapsed())] BACKEND PATH COMPLETE  txTotal=\(txTotalCount) displayed=\(txDisplayLimit)")
+                self.finishLoading(cacheKey: capturedAddress.lowercased())
+                print("⏱ [\(self.elapsed())] BG PHASE2 COMPLETE  tx=\(self.transactions.count) txTotal=\(self.txTotalCount)")
+            }
             return true
         } catch {
             print("⏱ [\(elapsed())] BACKEND ERROR: \(error)")
@@ -556,62 +587,82 @@ final class WalletDetailViewModel: ObservableObject {
     /// Phase 1: positions + orders (instant display)
     /// Phase 2: spot + fills, staking, HIP-3 (background)
     private func loadFromHLAPI(address: String) async {
+        // ── Phase 1: positions + orders (first render) ──
         do {
-            // ── All network requests in parallel ──
-            print("⏱ [\(elapsed())] HLAPI START (state + spot + midPrices + fills + ledger)")
-            async let stateTask  = api.fetchUserState(address: address)
-            async let spotTask   = api.fetchSpotState(address: address)
+            print("⏱ [\(elapsed())] HLAPI PHASE1 START (state + spot + midPrices)")
+            async let stateTask = api.fetchUserState(address: address)
+            async let spotTask  = api.fetchSpotState(address: address)
             async let midTask: () = fetchMidPrices()
-            async let fillsTask  = api.fetchUserFills(address: address)
-            async let ledgerTask = { try? await self.api.fetchLedgerUpdates(address: address) }()
 
-            // ── Phase 1: positions + orders (first render) ──
             let state = try await stateTask
             print("⏱ [\(elapsed())] HLAPI STATE RECEIVED")
 
+            // Race guard: if backend already won, abort — don't overwrite state.
+            guard !hasFetched else {
+                print("⏱ [\(elapsed())] HLAPI ABORTED — backend already won")
+                return
+            }
+
             parsePositions(from: state)
             print("⏱ [\(elapsed())] HLAPI PARSE POSITIONS END  count=\(positions.count)")
-            parseOrders(from: state)
-            print("⏱ [\(elapsed())] HLAPI PARSE ORDERS END  count=\(openOrders.count)")
             hasFetched = true
             print("⏱ [\(elapsed())] ✅ hasFetched = true (UI can render)")
 
-            // ── Phase 2a: fills + transactions (may already be done, pure CPU after await) ──
-            let rawFills = (try? await fillsTask) ?? []
-            let ledger   = await ledgerTask ?? []
-            print("⏱ [\(elapsed())] HLAPI FILLS+LEDGER RECEIVED  fills=\(rawFills.count) ledger=\(ledger.count)")
-
-            parseFills(rawFills)
-            parseTransactions(ledger)
-            mergeFillsIntoTransactions()
-            txTotalFills  = rawFills.count
-            txLoadAddress = address
-            computeOverview()
-            print("⏱ [\(elapsed())] HLAPI TRANSACTIONS READY  total=\(transactions.count)")
-
-            // ── Phase 2b: spot (needs midprices) ──
+            // ── Phase 2: background prefetch (separate Task, never blocks render) ──
+            // Awaiting spot+midprices is the first yield after hasFetched=true,
+            // giving SwiftUI a chance to render positions. Both started in parallel
+            // with state, so they're likely already resolved.
             let spot = (try? await spotTask) ?? [:]
             await midTask
-            print("⏱ [\(elapsed())] HLAPI SPOT+MIDPRICES DONE")
-            parseSpot(spot)
 
-            // ── Phase 3: staking + HIP-3 (least critical) ──
-            print("⏱ [\(elapsed())] HLAPI PHASE3 START (staking, HIP3)")
-            await loadSecondaryData(address: address)
-            print("⏱ [\(elapsed())] HLAPI PHASE3 COMPLETE")
+            let capturedAddress = address
+            let capturedState = state
+            Task { [weak self] in
+                guard let self else { return }
+                print("⏱ [\(self.elapsed())] HLAPI BG PREFETCH START")
+
+                self.parseOrders(from: capturedState)
+                print("⏱ [\(self.elapsed())] HLAPI PARSE ORDERS END  count=\(self.openOrders.count)")
+                self.parseSpot(spot)
+                self.computeOverview()
+                print("⏱ [\(self.elapsed())] HLAPI SPOT DONE")
+
+                // Fills + ledger + staking + HIP-3
+                await self.loadSecondaryData(address: capturedAddress)
+
+                self.finishLoading(cacheKey: capturedAddress.lowercased())
+                print("⏱ [\(self.elapsed())] HLAPI BG PREFETCH COMPLETE  tx=\(self.transactions.count)")
+            }
         } catch {
             errorMsg = error.localizedDescription
         }
     }
 
-    /// Load staking + HIP-3 data (fills/ledger are now fetched earlier in loadFromHLAPI).
+    /// Load fills, ledger, staking, HIP-3 after positions are displayed.
     private func loadSecondaryData(address: String) async {
         // Fetch validator names if not cached yet
         if Self.validatorNames == nil {
             Task { await Self.loadValidatorNames() }
         }
 
-        // Staking data (3 calls)
+        // Batch 1: fills + ledger (2 calls)
+        async let fillsTask  = api.fetchUserFills(address: address)
+        async let ledgerTask = try? api.fetchLedgerUpdates(address: address)
+        let rawFills = (try? await fillsTask) ?? []
+        let ledger   = await ledgerTask ?? []
+
+        parseFills(rawFills)
+        parseTransactions(ledger)
+        mergeFillsIntoTransactions()
+        txTotalFills  = rawFills.count
+        txLoadAddress = address
+        computeOverview()
+        print("⏱ [\(elapsed())] HLAPI SECONDARY TX READY  tx=\(transactions.count)")
+
+        // Small delay to avoid rate limiting
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        // Batch 2: staking data (3 calls)
         async let stakeSumTask = try? api.fetchDelegatorSummary(address: address)
         async let delegTask    = try? api.fetchDelegations(address: address)
         async let rewardsTask  = try? api.fetchDelegatorRewards(address: address)
@@ -629,25 +680,7 @@ final class WalletDetailViewModel: ObservableObject {
             parseHIP3Positions(from: dexState)
         }
         parseStaking(summary: stakeSum, delegations: delegs, rewards: rewards)
-
-        // Update cache with complete data
-        let cacheKey = address.lowercased()
-        Self.walletCache[cacheKey] = CachedWallet(
-            positions: positions, openOrders: openOrders,
-            spotBalances: spotBalances, fills: fills,
-            transactions: transactions, staking: staking,
-            totalPnl: totalPnl, winrate: winrate,
-            totalVolume: totalVolume, bestTrade: bestTrade,
-            alias: alias, date: Date()
-        )
-        // Evict oldest entry if cache exceeds size limit (HIGH-07)
-        if Self.walletCache.count > Self.maxCacheSize {
-            if let oldest = Self.walletCache.min(by: { $0.value.date < $1.value.date }) {
-                Self.walletCache.removeValue(forKey: oldest.key)
-            }
-        }
-
-        // Older fills are now loaded on demand via "Load More" button
+        // Cache writing + isLoading=false handled by finishLoading() in the caller.
     }
 
     // MARK: - Background fill scanning

@@ -5,8 +5,7 @@ struct LiquidationsView: View {
     @State private var showFilters = true
     @ObservedObject private var appState = AppState.shared
 
-    enum SizeField { case min, max }
-    @FocusState private var focusedSizeField: SizeField?
+    @FocusState private var maxSizeFieldFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -42,6 +41,52 @@ struct LiquidationsView: View {
                                 liquidationRow(liq)
                             }
                             .padding(.horizontal, 14)
+                            // Auto-load more when approaching the bottom (infinite scroll)
+                            .onAppear {
+                                if liq.id == vm.liquidations.last?.id, vm.hasMore, !vm.isLoadingMore {
+                                    Task { await vm.loadMore() }
+                                }
+                            }
+                        }
+
+                        // Load More indicator / manual button
+                        if vm.hasMore {
+                            if vm.isLoadingMore {
+                                HStack {
+                                    Spacer()
+                                    ProgressView().tint(.white)
+                                    Text("Loading…")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(Color(white: 0.4))
+                                    Spacer()
+                                }
+                                .padding(.vertical, 12)
+                            } else {
+                                Button {
+                                    Task { await vm.loadMore() }
+                                } label: {
+                                    HStack {
+                                        Spacer()
+                                        Text("Load More (\(vm.liquidations.count) of \(vm.totalFiltered))")
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .foregroundColor(.hlGreen)
+                                        Spacer()
+                                    }
+                                    .padding(.vertical, 12)
+                                    .background(Color(white: 0.09))
+                                    .cornerRadius(10)
+                                    .padding(.horizontal, 14)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+
+                        // Bottom status
+                        if !vm.hasMore && vm.liquidations.count > 0 {
+                            Text("\(vm.liquidations.count) liquidations loaded")
+                                .font(.system(size: 11))
+                                .foregroundColor(Color(white: 0.3))
+                                .padding(.vertical, 8)
                         }
                     }
                     .padding(.top, 4)
@@ -56,20 +101,9 @@ struct LiquidationsView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
-                Button { focusedSizeField = .min } label: {
-                    Image(systemName: "chevron.up")
-                }
-                .disabled(focusedSizeField == .min)
-
-                Button { focusedSizeField = .max } label: {
-                    Image(systemName: "chevron.down")
-                }
-                .disabled(focusedSizeField == .max)
-
                 Spacer()
-
                 Button("Done") {
-                    focusedSizeField = nil
+                    maxSizeFieldFocused = false
                 }
                 .fontWeight(.semibold)
                 .foregroundColor(.hlGreen)
@@ -170,15 +204,23 @@ struct LiquidationsView: View {
                 }
             }
 
-            // Size filter fields (collapsible)
+            // Size filter (collapsible)
             if showFilters {
                 HStack(spacing: 8) {
-                    sizeField("Min $", text: $vm.minSize)
-                        .focused($focusedSizeField, equals: .min)
+                    // Min size is server-enforced — show as label
+                    Text(">= $1,000")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Color(white: 0.45))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(Color(white: 0.09))
+                        .cornerRadius(8)
+
                     sizeField("Max $", text: $vm.maxSize)
-                        .focused($focusedSizeField, equals: .max)
+                        .focused($maxSizeFieldFocused)
+
                     Button("Apply") {
-                        focusedSizeField = nil
+                        maxSizeFieldFocused = false
                         Task { await vm.fetch() }
                     }
                     .font(.system(size: 12, weight: .semibold))
@@ -194,7 +236,7 @@ struct LiquidationsView: View {
     }
 
     private var hasActiveFilters: Bool {
-        !vm.minSize.isEmpty || !vm.maxSize.isEmpty
+        !vm.maxSize.isEmpty
     }
 
     private func sizeField(_ placeholder: String, text: Binding<String>) -> some View {

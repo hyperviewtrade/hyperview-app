@@ -56,15 +56,22 @@ final class LiquidationsViewModel: ObservableObject {
     @Published var minSize: String = "1,000"
     @Published var maxSize: String = ""
     @Published var isLoading = false
+    @Published var isLoadingMore = false
+    @Published var totalFiltered = 0               // total matching items in backend history
     @Published var notificationRules: [NotificationRule] = []
     @Published var showNotificationSettings = false
     @Published var showMarketPicker = false
+
+    /// True when there are more items in history to load
+    var hasMore: Bool { totalFiltered > liquidations.count }
 
     private static let backendBaseURL = Configuration.backendBaseURL
     private var pollTimer: AnyCancellable?
     private var backgroundPollTimer: AnyCancellable?
     private var notifiedIds: Set<String> = []
     private var isViewVisible = false
+    /// Timestamp of newest liquidation — used for delta polling (since=)
+    private var newestTimestamp: Double = 0
 
     init() {
         loadNotificationRules()
@@ -136,36 +143,82 @@ final class LiquidationsViewModel: ObservableObject {
         } else {
             selectedCoins.insert(coin)
         }
-        Task { await fetch() }
+        Task { await fetchFirstPage() }
     }
 
     func selectAllMarkets() {
         selectedCoins.removeAll()
-        Task { await fetch() }
+        Task { await fetchFirstPage() }
     }
 
-    func fetch() async {
-        var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
-        var queryItems: [URLQueryItem] = [
-            URLQueryItem(name: "limit", value: "100")
-        ]
+    // MARK: - Fetch (3 modes: first page, delta poll, load more)
 
-        // Send all selected coins to backend for server-side filtering
+    /// Build common query items for current filter state.
+    private func filterQueryItems() -> [URLQueryItem] {
+        var items: [URLQueryItem] = []
         if !selectedCoins.isEmpty {
             for coin in selectedCoins.sorted() {
-                queryItems.append(URLQueryItem(name: "coin", value: coin))
+                items.append(URLQueryItem(name: "coin", value: coin))
             }
         }
         if selectedSide != "All" {
-            queryItems.append(URLQueryItem(name: "side", value: selectedSide.lowercased()))
+            items.append(URLQueryItem(name: "side", value: selectedSide.lowercased()))
         }
         if let min = Double(stripCommas(minSize)), min > 0 {
-            queryItems.append(URLQueryItem(name: "minSize", value: String(min)))
+            items.append(URLQueryItem(name: "minSize", value: String(min)))
         }
         if let max = Double(stripCommas(maxSize)), max > 0 {
-            queryItems.append(URLQueryItem(name: "maxSize", value: String(max)))
+            items.append(URLQueryItem(name: "maxSize", value: String(max)))
+        }
+        return items
+    }
+
+    /// First page load — replaces the list, resets pagination state.
+    private func fetchFirstPage() async {
+        newestTimestamp = 0
+        var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
+        var queryItems = filterQueryItems()
+        queryItems.append(URLQueryItem(name: "limit", value: "30"))
+        components.queryItems = queryItems
+        guard let url = components.url else { return }
+
+        print("[LIQ] FIRST PAGE REQUEST: \(url.absoluteString)")
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let response = try JSONDecoder().decode(LiquidationsResponse.self, from: data)
+
+            checkNotifications(response.liquidations)
+            liquidations = response.liquidations
+            totalFiltered = response.total ?? response.liquidations.count
+
+            if let newest = liquidations.first?.timestamp {
+                newestTimestamp = newest
+            }
+            if let coins = response.availableCoins, !coins.isEmpty {
+                availableCoins = ["All"] + coins
+            }
+
+            let minUSD = liquidations.map(\.sizeUSD).min() ?? 0
+            let maxUSD = liquidations.map(\.sizeUSD).max() ?? 0
+            print("[LIQ] FIRST PAGE: count=\(liquidations.count) total=\(totalFiltered) hasMore=\(hasMore) minUSD=\(minUSD) maxUSD=\(maxUSD)")
+        } catch {
+            print("[LIQ] FIRST PAGE DECODE ERROR: \(error)")
+        }
+    }
+
+    /// Delta poll — only fetches items newer than what we have.
+    /// Called by the 15s/30s timer. Small payload, no pagination.
+    func fetch() async {
+        // If no data yet, do a first page load instead
+        guard newestTimestamp > 0 else {
+            await fetchFirstPage()
+            return
         }
 
+        var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
+        var queryItems = filterQueryItems()
+        queryItems.append(URLQueryItem(name: "since", value: String(Int64(newestTimestamp))))
+        queryItems.append(URLQueryItem(name: "limit", value: "50"))
         components.queryItems = queryItems
         guard let url = components.url else { return }
 
@@ -173,31 +226,84 @@ final class LiquidationsViewModel: ObservableObject {
             let (data, _) = try await URLSession.shared.data(from: url)
             let response = try JSONDecoder().decode(LiquidationsResponse.self, from: data)
 
-            // Check new liquidations against notification rules
-            if !notificationRules.isEmpty {
-                let newOnes = response.liquidations.filter { !notifiedIds.contains($0.id) }
-                for liq in newOnes {
-                    notifiedIds.insert(liq.id)
-                    if matchesAnyRule(liq) {
-                        sendLocalNotification(liq)
-                    }
+            checkNotifications(response.liquidations)
+
+            if !response.liquidations.isEmpty {
+                // Prepend new items at the top, dedup by id
+                let existingIds = Set(liquidations.map(\.id))
+                let fresh = response.liquidations.filter { !existingIds.contains($0.id) }
+                if !fresh.isEmpty {
+                    liquidations = fresh + liquidations
+                    totalFiltered += fresh.count
                 }
-                // Keep notifiedIds from growing unbounded
-                if notifiedIds.count > 500 {
-                    let currentIds = Set(response.liquidations.map(\.id))
-                    notifiedIds = notifiedIds.intersection(currentIds)
-                }
-                // Sync to disk so background service doesn't re-notify
-                LiquidationNotificationService.shared.persistNotifiedIds(notifiedIds)
             }
 
-            liquidations = response.liquidations
-            if !response.availableCoins.isEmpty {
-                availableCoins = ["All"] + response.availableCoins
+            if let newest = liquidations.first?.timestamp, newest > newestTimestamp {
+                newestTimestamp = newest
             }
         } catch {
             // Silently fail — will retry on next poll
         }
+    }
+
+    /// Load more — fetches older items using before= cursor.
+    func loadMore() async {
+        print("[LIQ] LOAD MORE: hasMore=\(hasMore) isLoadingMore=\(isLoadingMore) count=\(liquidations.count) totalFiltered=\(totalFiltered)")
+        guard !isLoadingMore, hasMore else {
+            print("[LIQ] LOAD MORE GUARD FAILED: isLoadingMore=\(isLoadingMore) hasMore=\(hasMore)")
+            return
+        }
+        guard let oldestTs = liquidations.last?.timestamp else {
+            print("[LIQ] LOAD MORE: no oldest timestamp")
+            return
+        }
+
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+
+        var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
+        var queryItems = filterQueryItems()
+        queryItems.append(URLQueryItem(name: "before", value: String(Int64(oldestTs))))
+        queryItems.append(URLQueryItem(name: "limit", value: "30"))
+        components.queryItems = queryItems
+        guard let url = components.url else { return }
+
+        print("[LIQ] LOAD MORE REQUEST: before=\(Int64(oldestTs)) url=\(url.absoluteString)")
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let response = try JSONDecoder().decode(LiquidationsResponse.self, from: data)
+
+            print("[LIQ] LOAD MORE RESPONSE: count=\(response.liquidations.count) total=\(response.total ?? -1)")
+            if !response.liquidations.isEmpty {
+                let existingIds = Set(liquidations.map(\.id))
+                let older = response.liquidations.filter { !existingIds.contains($0.id) }
+                liquidations.append(contentsOf: older)
+                print("[LIQ] LOAD MORE APPENDED: \(older.count) new items, total=\(liquidations.count)")
+            }
+            // Stop pagination if server returned fewer items than requested (end of data)
+            if response.liquidations.count < 30 {
+                totalFiltered = liquidations.count
+                print("[LIQ] LOAD MORE: reached end of data, totalFiltered=\(totalFiltered)")
+            }
+        } catch {
+            print("[LIQ] LOAD MORE DECODE ERROR: \(error)")
+        }
+    }
+
+    private func checkNotifications(_ items: [LiquidationItem]) {
+        guard !notificationRules.isEmpty else { return }
+        let newOnes = items.filter { !notifiedIds.contains($0.id) }
+        for liq in newOnes {
+            notifiedIds.insert(liq.id)
+            if matchesAnyRule(liq) {
+                sendLocalNotification(liq)
+            }
+        }
+        if notifiedIds.count > 500 {
+            let currentIds = Set(items.map(\.id))
+            notifiedIds = notifiedIds.intersection(currentIds)
+        }
+        LiquidationNotificationService.shared.persistNotifiedIds(notifiedIds)
     }
 
     // MARK: - All Perp Markets (main DEX + HIP-3)
@@ -340,22 +446,58 @@ final class LiquidationsViewModel: ObservableObject {
 
 struct LiquidationsResponse: Decodable {
     let count: Int
+    let total: Int?                // total matching items in history (for hasMore)
     let liquidations: [LiquidationItem]
-    let availableCoins: [String]
+    let availableCoins: [String]?  // nil on delta/pagination fetches
 }
 
 struct LiquidationItem: Identifiable, Decodable {
     let id: String
     let coin: String
     let address: String
-    let shortAddress: String
-    let side: String
+    let side: String           // "LONG" / "SHORT"
     let sizeUSD: Double
     let price: Double
     let entryPrice: Double?
     let leverage: Int?
-    let method: String?
     let timestamp: Double
+
+    /// Decode both legacy (full field names) and slim (short keys) formats.
+    enum CodingKeys: String, CodingKey {
+        // Slim keys (new backend)
+        case id, c, a, s, usd, px, ep, lev, ts
+        // Legacy keys (backward compat)
+        case coin, address, side, sizeUSD, price, entryPrice, leverage, timestamp
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        // Slim → legacy fallback for each field
+        if let v = try? container.decode(String.self, forKey: .c) { coin = v }
+        else { coin = try container.decode(String.self, forKey: .coin) }
+        if let v = try? container.decode(String.self, forKey: .a) { address = v }
+        else { address = try container.decode(String.self, forKey: .address) }
+        if let v = try? container.decode(Double.self, forKey: .usd) { sizeUSD = v }
+        else { sizeUSD = try container.decode(Double.self, forKey: .sizeUSD) }
+        if let v = try? container.decode(Double.self, forKey: .px) { price = v }
+        else { price = try container.decode(Double.self, forKey: .price) }
+        entryPrice = (try? container.decode(Double.self, forKey: .ep)) ?? (try? container.decode(Double.self, forKey: .entryPrice))
+        leverage = (try? container.decode(Int.self, forKey: .lev)) ?? (try? container.decode(Int.self, forKey: .leverage))
+        if let v = try? container.decode(Double.self, forKey: .ts) { timestamp = v }
+        else { timestamp = try container.decode(Double.self, forKey: .timestamp) }
+        // Side: slim uses "L"/"S", legacy uses "LONG"/"SHORT"
+        if let slim = try? container.decode(String.self, forKey: .s) {
+            side = slim == "L" ? "LONG" : "SHORT"
+        } else {
+            side = try container.decode(String.self, forKey: .side)
+        }
+    }
+
+    var shortAddress: String {
+        guard address.count > 10 else { return address }
+        return "\(address.prefix(6))…\(address.suffix(4))"
+    }
 
     var formattedSize: String {
         if sizeUSD >= 1_000_000 { return String(format: "$%.1fM", sizeUSD / 1_000_000) }

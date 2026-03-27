@@ -162,7 +162,8 @@ struct TWAPView: View {
             }
 
             // ── Content ────────────────────────────────────────
-            if vm.isLoading && vm.orders.isEmpty {
+            if vm.orders.isEmpty && !vm.hasLoaded {
+                // Not loaded yet — show loading (never "No TWAP")
                 Spacer()
                 VStack(spacing: 10) {
                     ProgressView()
@@ -179,7 +180,8 @@ struct TWAPView: View {
                 Spacer()
                 errorView(error)
                 Spacer()
-            } else if vm.filteredOrders.isEmpty {
+            } else if vm.filteredOrders.isEmpty && vm.hasLoaded {
+                // Loaded successfully but filters produce no results
                 Spacer()
                 Text(vm.showActiveOnly ? "No active TWAPs" : "No TWAPs found")
                     .font(.system(size: 14))

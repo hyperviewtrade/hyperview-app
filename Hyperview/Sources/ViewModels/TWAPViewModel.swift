@@ -150,6 +150,8 @@ final class TWAPViewModel: ObservableObject {
 
     @Published var orders: [TWAPOrder] = []
     @Published var isLoading = false
+    /// True once the first successful fetch has completed (distinguishes "not loaded" from "truly empty").
+    @Published var hasLoaded = false
     @Published var errorMsg: String?
     @Published var progressText: String?
     @Published var showActiveOnly = true
@@ -215,9 +217,7 @@ final class TWAPViewModel: ObservableObject {
 
     func startPolling() {
         guard pollTimer == nil else { return }
-        Task { await fetch() }
-
-        // Poll every 15 seconds for new TWAPs
+        // Don't fetch here — load() already fetched. Just start the timer.
         pollTimer = Timer.publish(every: 15, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -233,17 +233,37 @@ final class TWAPViewModel: ObservableObject {
 
     func fetch() async {
         let urlStr = "\(Self.backendBase)/twaps?activeOnly=true&limit=1000"
+        let t0 = CFAbsoluteTimeGetCurrent()
+        print("[TWAP] FETCH START  hasLoaded=\(hasLoaded) orders=\(orders.count)")
 
         do {
             guard let url = URL(string: urlStr) else { return }
-            let (data, _) = try await URLSession.shared.data(from: url)
+
+            // Fetch TWAP list and buy pressure CONCURRENTLY (saves ~1.5s)
+            async let twapData = URLSession.shared.data(from: url)
+            async let pressureTask: Void = fetchBuyPressure()
+
+            let (data, response) = try await twapData
+
+            // If backend returns 503 (tracker not ready), keep loading state
+            if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 503 {
+                print("[TWAP] BACKEND NOT READY (503) — will retry")
+                _ = await pressureTask
+                return
+            }
 
             let parsed = await Task.detached(priority: .userInitiated) {
                 Self.parseResponse(data)
             }.value
 
-            // Merge: keep existing order IDs stable to avoid list flicker
+            // Update orders (never clear to empty on success — server returns current state)
             orders = parsed.orders
+            hasLoaded = true
+            errorMsg = nil
+            let activeCount = orders.filter { $0.isActive }.count
+            let elapsed = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+            print("[TWAP] FETCH SUCCESS  count=\(orders.count) active=\(activeCount) filteredOrders=\(filteredOrders.count) elapsed=\(elapsed)ms")
+
             // Only update coin list if it actually changed (prevents Menu reset during scroll)
             let filteredCoins = parsed.coins.filter { !$0.hasPrefix("Asset#") }
             if filteredCoins != availableCoins {
@@ -254,16 +274,20 @@ final class TWAPViewModel: ObservableObject {
                 progressText = nil
                 isLoading = false
             }
+
+            // Wait for concurrent pressure fetch to complete
+            _ = await pressureTask
         } catch {
-            if isLoading {
+            print("[TWAP] FETCH FAILURE  error=\(error.localizedDescription) staleOrders=\(orders.count)")
+            // Only set errorMsg if we have NO stale data to show
+            if orders.isEmpty {
                 errorMsg = error.localizedDescription
+            }
+            if isLoading {
                 progressText = nil
                 isLoading = false
             }
         }
-
-        // Also fetch buy pressure for HYPE
-        await fetchBuyPressure()
     }
 
     func fetchBuyPressure() async {
@@ -271,26 +295,51 @@ final class TWAPViewModel: ObservableObject {
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                hypePressure1hUSD = json["next1hUSD"] as? Double ?? 0
-                hypePressure24hUSD = json["next24hUSD"] as? Double ?? 0
+                // Handle both Int and Double from JSON (JSONSerialization may return Int for whole numbers)
+                hypePressure1hUSD = (json["next1hUSD"] as? NSNumber)?.doubleValue ?? 0
+                hypePressure24hUSD = (json["next24hUSD"] as? NSNumber)?.doubleValue ?? 0
+                print("[TWAP] BUY PRESSURE: 1h=$\(hypePressure1hUSD) 24h=$\(hypePressure24hUSD)")
             }
-        } catch {}
+        } catch {
+            print("[TWAP] BUY PRESSURE FETCH FAILURE: \(error.localizedDescription)")
+        }
     }
 
     func load() async {
         guard !isLoading else { return }
-        isLoading = true
-        errorMsg = nil
-        progressText = "Loading TWAPs..."
+        let t0 = CFAbsoluteTimeGetCurrent()
+        print("[TWAP] LOAD START  hasLoaded=\(hasLoaded) orders=\(orders.count)")
+        if orders.isEmpty {
+            isLoading = true
+            errorMsg = nil
+            progressText = "Loading TWAPs..."
+        }
         await fetch()
+
+        // If backend wasn't ready (503 or empty), retry a few times quickly
+        if orders.isEmpty && !hasLoaded {
+            for retry in 1...3 {
+                print("[TWAP] LOAD RETRY \(retry)/3 — backend may still be warming up")
+                try? await Task.sleep(for: .seconds(3))
+                await fetch()
+                if !orders.isEmpty { break }
+            }
+        }
+
+        let elapsed = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        print("[TWAP] LOAD COMPLETE  orders=\(orders.count) hasLoaded=\(hasLoaded) elapsed=\(elapsed)ms")
         startPolling()
     }
 
     func refresh() async {
-        orders = []
+        // Reset filters but keep stale orders visible during refresh.
+        // Orders are replaced atomically when fetch() succeeds.
         selectedCoin = "All"
-        isLoading = true
-        progressText = "Loading TWAPs..."
+        if orders.isEmpty {
+            isLoading = true
+            progressText = "Loading TWAPs..."
+        }
+        print("[TWAP] REFRESH START  staleOrders=\(orders.count)")
         await fetch()
     }
 

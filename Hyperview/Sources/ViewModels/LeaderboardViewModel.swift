@@ -113,10 +113,23 @@ final class LeaderboardViewModel: ObservableObject {
         return arr.compactMap { dict -> LeaderboardEntry? in
             guard let ethAddress = dict["ethAddress"] as? String else { return nil }
             guard seen.insert(ethAddress).inserted else { return nil }
-            let accountValue = Double(dict["accountValue"] as? String ?? "0") ?? 0
+            // accountValue can be String (legacy) or Number (new slim format)
+            let accountValue: Double
+            if let n = dict["accountValue"] as? Double { accountValue = n }
+            else { accountValue = Double(dict["accountValue"] as? String ?? "0") ?? 0 }
             let displayName = dict["displayName"] as? String
 
             var performances: [String: WindowPerformance] = [:]
+
+            // New slim format: flat pnl/vlm/roi fields (single timeframe)
+            if let pnl = dict["pnl"] as? Double {
+                let vlm = dict["vlm"] as? Double ?? 0
+                let roi = dict["roi"] as? Double ?? 0
+                // Store under a generic key — backend already sorted by requested timeframe
+                performances["_current"] = WindowPerformance(pnl: pnl, roi: roi, vlm: vlm)
+            }
+
+            // Legacy format: nested windowPerformances array
             if let windows = dict["windowPerformances"] as? [[Any]] {
                 for window in windows {
                     guard window.count >= 2,
@@ -151,7 +164,8 @@ struct LeaderboardEntry: Identifiable {
     let performances: [String: WindowPerformance]
 
     func performanceFor(_ timeframe: String) -> WindowPerformance? {
-        performances[timeframe]
+        // New slim format stores under "_current" (already sorted by backend)
+        performances[timeframe] ?? performances["_current"]
     }
 
     var shortAddress: String {
