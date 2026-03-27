@@ -9,30 +9,47 @@ enum KeyboardDoneBarSetup {
     private static var installed = false
     private static var observers: [Any] = []
 
+    /// Walk the responder chain to check if a view lives inside a WKWebView.
+    private static func isInsideWKWebView(_ view: UIView) -> Bool {
+        var current: UIView? = view.superview
+        while let v = current {
+            if String(describing: type(of: v)).contains("WKWebView") ||
+               String(describing: type(of: v)).contains("WKContentView") {
+                return true
+            }
+            current = v.superview
+        }
+        return false
+    }
+
     static func install() {
         guard !installed else { return }
         installed = true
 
         let nc = NotificationCenter.default
 
-        // UITextField — fires when any text field in the app begins editing
+        // UITextField — fires when any text field in the app begins editing.
+        // Skip WKWebView internal fields — they trigger the Done bar without a keyboard.
         observers.append(nc.addObserver(
             forName: UITextField.textDidBeginEditingNotification,
             object: nil, queue: .main
         ) { note in
-            guard let tf = note.object as? UITextField else { return }
+            guard let tf = note.object as? UITextField,
+                  !Self.isInsideWKWebView(tf) else { return }
             if tf.inputAccessoryView == nil || tf.inputAccessoryView is DoneAccessoryBar == false {
                 tf.inputAccessoryView = DoneAccessoryBar()
                 tf.reloadInputViews()
             }
         })
 
-        // UITextView — fires when any text view in the app begins editing
+        // UITextView — fires when any text view in the app begins editing.
+        // Skip WKWebView internal fields.
         observers.append(nc.addObserver(
             forName: UITextView.textDidBeginEditingNotification,
             object: nil, queue: .main
         ) { note in
-            guard let tv = note.object as? UITextView else { return }
+            guard let tv = note.object as? UITextView,
+                  !Self.isInsideWKWebView(tv) else { return }
             if tv.inputAccessoryView == nil || tv.inputAccessoryView is DoneAccessoryBar == false {
                 tv.inputAccessoryView = DoneAccessoryBar()
                 tv.reloadInputViews()

@@ -179,6 +179,13 @@ struct ContentView: View {
         // Load markets from the root view — ContentView never disappears,
         // so this Task is never cancelled by tab switching.
         .task { await marketsVM.loadMarkets() }
+        // Early candle prefetch — warms cache for the most likely first chart open.
+        // Deferred 1s so critical startup requests (markets, positions) get a head start.
+        .task {
+            try? await Task.sleep(for: .seconds(1))
+            let interval = chartVM.selectedInterval
+            TradingViewChartView.Coordinator.earlyPrefetch(symbol: "BTC", interval: interval)
+        }
         // Non-critical prefetches — deferred to reduce startup request storm
         .task {
             try? await Task.sleep(for: .seconds(5))

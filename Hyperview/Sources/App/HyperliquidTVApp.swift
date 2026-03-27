@@ -111,6 +111,10 @@ struct HyperliquidTVApp: App {
         KeyboardDoneBarSetup.install()
         IconCacheService.shared.refreshIfNeeded()
 
+        // Pre-spawn WebKit process during splash — saves ~50-100ms on first chart open.
+        // Creates a throwaway WKWebView with the shared process pool, immediately released.
+        WebKitWarmup.prespawn()
+
         // Connect backend relay at app launch
         RelayClient.shared.connect()
 

@@ -18,6 +18,10 @@ final class ChartViewModel: ObservableObject {
     @Published var errorMessage:          String?
     @Published var livePrice:             Double     = 0
 
+    /// True once TradingView has fully rendered its first chart (chartReady callback).
+    /// Used by ChartContainerView to hide the loading skeleton.
+    @Published var isChartReady           = false
+
     /// Incremented to signal the TradingView WebView to re-fetch data
     @Published var refreshTrigger:       Int        = 0
 
@@ -140,19 +144,23 @@ final class ChartViewModel: ObservableObject {
     func loadChart(symbol: String, interval: ChartInterval,
                    displayName: String? = nil, perpEquivalent: String? = nil) async {
 
-        // Debounce rapid market switches: cancel pending load if user switches again within 150ms
+        // Debounce rapid market switches: cancel pending load if user switches again within 150ms.
+        // Skip debounce on first open (candles empty) — no previous state to protect, saves 150ms.
         pendingLoadSymbol = symbol
-        loadDebounceTask?.cancel()
-        loadDebounceTask = Task {
-            try? await Task.sleep(nanoseconds: 150_000_000) // 150ms debounce
-            guard !Task.isCancelled, pendingLoadSymbol == symbol else { return }
+        if !candles.isEmpty {
+            loadDebounceTask?.cancel()
+            loadDebounceTask = Task {
+                try? await Task.sleep(nanoseconds: 150_000_000) // 150ms debounce
+                guard !Task.isCancelled, pendingLoadSymbol == symbol else { return }
+            }
+            try? await loadDebounceTask?.value
+            guard pendingLoadSymbol == symbol else { return } // Another switch happened
         }
-        try? await loadDebounceTask?.value
-        guard pendingLoadSymbol == symbol else { return } // Another switch happened
 
         // Unsubscribe previous candles & order book (use full symbol with dex prefix)
         let prevCoin     = selectedSymbol
         let prevInterval = selectedInterval
+        let isSymbolChange = prevCoin != symbol
         ws.unsubscribeCandles(coin: prevCoin, interval: prevInterval)
         unsubscribeOrderBook(clearDisplay: true)
 
@@ -199,8 +207,13 @@ final class ChartViewModel: ObservableObject {
 
         isLoading = false
 
-        // Signal TradingView chart to re-fetch bars from the bridge
-        refreshTrigger += 1
+        // Signal TradingView chart to re-fetch bars from the bridge.
+        // Only needed for explicit reload (same symbol) — when the symbol changed,
+        // TradingView's setSymbol() already triggered getBars. Firing resetData()
+        // on top of that causes a visible flash (chart blanks then re-renders).
+        if !isSymbolChange {
+            refreshTrigger += 1
+        }
 
         // Re-subscribe order book for the new symbol so it doesn't stay
         // empty if the user was already on the Order Book tab.

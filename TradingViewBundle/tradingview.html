@@ -8,73 +8,22 @@
         html, body { width: 100%; height: 100%; overflow: hidden; background: #0A0A0A; }
         #tv_chart_container { width: 100%; height: 100%; }
 
-        /* Custom toolbar toggle button — draggable vertically */
-        #customToolbarBtn {
-            position: fixed;
-            left: 0;
-            top: 80px;
-            z-index: 9999;
-            width: 28px;
-            height: 44px;
-            background: rgba(30, 30, 30, 0.85);
-            border: none;
-            border-radius: 0 8px 8px 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            -webkit-tap-highlight-color: transparent;
-            touch-action: none;
-            backdrop-filter: blur(4px);
-            -webkit-backdrop-filter: blur(4px);
-            transition: background 0.15s, opacity 0.2s;
-            opacity: 0.55;
-            user-select: none;
-            -webkit-user-select: none;
-        }
-        #customToolbarBtn:active {
-            background: rgba(50, 50, 50, 0.95);
-        }
-        #customToolbarBtn.open {
-            opacity: 1;
-        }
-        #customToolbarBtn.dragging {
-            opacity: 1;
-            transition: none;
-        }
-        #customToolbarBtn svg {
-            width: 14px;
-            height: 14px;
-            fill: #999;
-            transition: transform 0.2s;
-            pointer-events: none;
-        }
-        #customToolbarBtn.open svg {
-            transform: rotate(180deg);
-            fill: #1DB954;
-        }
-
-        /* Hide the native TradingView expand/collapse arrow for the left toolbar.
-           We use display:none since we handle toggling via direct DOM manipulation. */
-        .layout__area--left > div[class*="collapsed"] > div,
+        /* Enlarge the native TradingView left toolbar toggle for easier mobile tapping */
         .layout__area--left [class*="arrow"],
         .layout__area--left [class*="toggle"],
         [data-name="drawing-toolbar"] [class*="arrow"],
-        [data-name="drawing-toolbar"] [class*="toggle"],
-        .drawing-toolbar [class*="toggle"],
-        .drawing-toolbar [class*="arrow"] {
-            display: none !important;
+        [data-name="drawing-toolbar"] [class*="toggle"] {
+            min-width: 28px !important;
+            min-height: 44px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
         }
     </style>
     <script type="text/javascript" src="charting_library.standalone.js"></script>
 </head>
 <body>
     <div id="tv_chart_container"></div>
-
-    <!-- Custom toolbar toggle button — positioned high, large tap target -->
-    <button id="customToolbarBtn" aria-label="Toggle drawing toolbar">
-        <svg viewBox="0 0 24 24"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
-    </button>
 
     <script>
     // ═══════════════════════════════════════════════════════════════
@@ -315,7 +264,7 @@
             studies_overrides: {
                 'volume.volume.color.0': '#E54D42',
                 'volume.volume.color.1': '#1DB954',
-                'volume.volume.transparency': 60,
+                'volume.volume.transparency': 70,
             },
 
             disabled_features: [
@@ -329,6 +278,13 @@
                 'volume_force_overlay',
                 'symbol_search_hot_key',
                 'border_around_the_chart',
+                // Additional: reduce init overhead for faster first paint
+                'create_volume_indicator_by_default',  // defer volume to after first paint
+                'header_undo_redo',                    // rarely used on mobile
+                'display_market_status',               // not needed for 24/7 crypto
+                'timeframes_toolbar',                  // bottom bar, already empty
+                'context_menus',                       // right-click menus, not needed on mobile
+                'control_bar',                         // bottom control bar
             ],
 
             enabled_features: [
@@ -340,35 +296,34 @@
         });
 
         tvWidget.onChartReady(function() {
-            // Ensure volume study is always present (fixes intermittent missing volume)
-            try {
-                var studies = tvWidget.activeChart().getAllStudies();
-                var hasVolume = studies.some(function(s) { return s.name === 'Volume'; });
-                if (!hasVolume) {
-                    tvWidget.activeChart().createStudy('Volume', false, false, {}, null, {
-                        'volume.volume.color.0': '#E54D42',
-                        'volume.volume.color.1': '#1DB954',
-                        'volume.volume.transparency': 60,
-                    });
-                }
-            } catch(e) {}
-
-            // Detect the initial state of the drawing toolbar from the DOM
-            var leftArea = document.querySelector('.layout__area--left');
-            if (leftArea) {
-                var cs = window.getComputedStyle(leftArea);
-                var isHidden = (cs.display === 'none') || (leftArea.offsetWidth === 0) || (cs.width === '0px');
-                drawingToolbarOpen = !isHidden;
-            } else {
-                drawingToolbarOpen = false;
-            }
-            var btn = document.getElementById('customToolbarBtn');
-            if (btn) btn.classList.toggle('open', drawingToolbarOpen);
-
-            // Notify Swift the chart is ready
+            // Notify Swift IMMEDIATELY — hides skeleton for fastest perceived load.
             window.webkit.messageHandlers.tradingview.postMessage(
                 JSON.stringify({ type: 'chartReady' })
             );
+
+            // Defer volume study to next event loop tick — after first paint.
+            setTimeout(function() {
+                try {
+                    var chart = tvWidget.activeChart();
+                    var studies = chart.getAllStudies();
+                    var hasVolume = studies.some(function(s) { return s.name === 'Volume'; });
+                    if (!hasVolume) {
+                        chart.createStudy('Volume', false, false, {}, null, {
+                            'volume.volume.color.0': '#E54D42',
+                            'volume.volume.color.1': '#1DB954',
+                            'volume.volume.transparency': 70,
+                        });
+                    }
+                    // Force volume pane to minimal height
+                    var allPanes = chart.getPanes();
+                    if (allPanes && allPanes.length > 1) {
+                        // Volume is typically the second pane — set its height ratio small
+                        try {
+                            allPanes[allPanes.length - 1].setHeight(60);
+                        } catch(e2) {}
+                    }
+                } catch(e) {}
+            }, 0);
         });
     }
 
@@ -465,104 +420,6 @@
         }
     }
 
-    // ─── Custom drawing toolbar toggle (draggable) ─────────
-    let drawingToolbarOpen = false;
-
-    function toggleDrawingToolbar() {
-        if (!tvWidget) return;
-
-        // Direct DOM manipulation — bypass executeActionById which double-toggles
-        var leftArea = document.querySelector('.layout__area--left');
-        if (!leftArea) return;
-
-        // Detect current state: toolbar is hidden if display is 'none' or width is '0px'
-        var computedStyle = window.getComputedStyle(leftArea);
-        var isCurrentlyHidden = (computedStyle.display === 'none') ||
-                                (leftArea.offsetWidth === 0) ||
-                                (computedStyle.width === '0px');
-
-        if (isCurrentlyHidden) {
-            // Expand: show the toolbar
-            leftArea.style.display = 'flex';
-            leftArea.style.width = '';
-            leftArea.style.minWidth = '';
-            leftArea.style.overflow = '';
-            drawingToolbarOpen = true;
-        } else {
-            // Collapse: hide the toolbar
-            leftArea.style.display = 'none';
-            drawingToolbarOpen = false;
-        }
-
-        var btn = document.getElementById('customToolbarBtn');
-        if (btn) btn.classList.toggle('open', drawingToolbarOpen);
-    }
-
-    // ─── Make the toolbar button draggable vertically ────
-    (function() {
-        const btn = document.getElementById('customToolbarBtn');
-        if (!btn) return;
-
-        let isDragging = false;
-        let startY = 0;
-        let startTop = 0;
-        let dragDistance = 0;
-        let touchHandled = false; // true when touchend already fired the toggle
-        const DRAG_THRESHOLD = 8; // px — below this it's a tap, above it's a drag
-
-        // Restore saved position
-        const savedTop = localStorage.getItem('toolbarBtnTop');
-        if (savedTop) btn.style.top = savedTop + 'px';
-
-        btn.addEventListener('touchstart', function(e) {
-            const touch = e.touches[0];
-            startY = touch.clientY;
-            startTop = parseInt(btn.style.top) || 80;
-            dragDistance = 0;
-            isDragging = false;
-        }, { passive: true });
-
-        btn.addEventListener('touchmove', function(e) {
-            e.preventDefault();
-            const touch = e.touches[0];
-            const dy = touch.clientY - startY;
-            dragDistance = Math.abs(dy);
-
-            if (dragDistance > DRAG_THRESHOLD) {
-                isDragging = true;
-                btn.classList.add('dragging');
-                const newTop = Math.max(20, Math.min(window.innerHeight - 60, startTop + dy));
-                btn.style.top = newTop + 'px';
-            }
-        }, { passive: false });
-
-        btn.addEventListener('touchend', function(e) {
-            btn.classList.remove('dragging');
-            if (isDragging) {
-                // Save position
-                const finalTop = parseInt(btn.style.top) || 80;
-                localStorage.setItem('toolbarBtnTop', finalTop);
-                isDragging = false;
-            } else {
-                // It was a tap — toggle toolbar
-                touchHandled = true;
-                toggleDrawingToolbar();
-            }
-        }, { passive: true });
-
-        // Click handler: only toggle if touchend did not already handle it.
-        // This ensures non-touch devices (desktop) still work, while touch
-        // devices don't double-fire (touchend + click).
-        btn.addEventListener('click', function(e) {
-            if (touchHandled) {
-                touchHandled = false;
-                e.preventDefault();
-                e.stopPropagation();
-                return;
-            }
-            toggleDrawingToolbar();
-        });
-    })();
     </script>
 </body>
 </html>

@@ -260,7 +260,7 @@ struct Market: Identifiable {
     }
 
     /// Compute the number of decimal places to display for a given price using 5 significant figures.
-    /// This matches Hyperliquid's native display precision across perps, spot, and HIP-3 markets.
+    /// Capped at 6 decimals to match Hyperliquid's maximum display precision.
     static func sigFigDecimals(_ price: Double, sigFigs: Int = 5) -> Int {
         let p = abs(price)
         guard p > 0 else { return 2 }
@@ -269,7 +269,7 @@ struct Market: Identifiable {
         if intDigits >= sigFigs {
             return 0
         }
-        return sigFigs - intDigits
+        return min(sigFigs - intDigits, 6)     // Hyperliquid never shows more than 6 decimals
     }
 }
 

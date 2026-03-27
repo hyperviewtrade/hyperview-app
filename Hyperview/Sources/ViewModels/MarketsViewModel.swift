@@ -652,6 +652,15 @@ final class MarketsViewModel: ObservableObject {
 
         markets = enriched.filter { $0.isSpot || $0.isHIP3 || $0.volume24h > 0 || $0.openInterest > 0 }
 
+        // Seed markPriceCache from market context — ensures HIP-3 prices are
+        // available for TradingView pricescale before any WebSocket tick arrives.
+        // allMids only covers main-DEX perps, so HIP-3 would otherwise be missing.
+        for m in markets where m.price > 0 {
+            if Self.markPriceCache[m.symbol] == nil || Self.markPriceCache[m.symbol] == 0 {
+                Self.markPriceCache[m.symbol] = m.price
+            }
+        }
+
         // Update szDecimals cache for position formatting
         for m in markets {
             Self.szDecimalsCache[m.asset.name] = m.asset.szDecimals

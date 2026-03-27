@@ -54,6 +54,7 @@ struct ChartContainerView: View {
                 .environmentObject(marketsVM)
         }
         .task {
+            print("[CHART-TIMING] CHART SCREEN OPEN")
             if chartVM.candles.isEmpty && !chartVM.isCustomTVChart {
                 await chartVM.loadChart(
                     symbol: chartVM.selectedSymbol,
@@ -209,14 +210,39 @@ struct ChartContainerView: View {
     @ViewBuilder
     private var chartContent: some View {
         VStack(spacing: 0) {
-            TradingViewChartView()
-                .environmentObject(chartVM)
+            ZStack {
+                TradingViewChartView()
+                    .environmentObject(chartVM)
+
+                // Loading skeleton — shows immediately while TradingView JS parses & renders
+                if !chartVM.isChartReady {
+                    chartLoadingSkeleton
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeOut(duration: 0.2), value: chartVM.isChartReady)
 
             // Long / Short quick-trade buttons (only for tradable HL markets)
             if !chartVM.isCustomTVChart {
                 longShortButtons
             }
         }
+    }
+
+    /// Lightweight loading skeleton that matches the chart area background
+    private var chartLoadingSkeleton: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            ProgressView()
+                .tint(Color(white: 0.4))
+                .scaleEffect(1.2)
+            Text("Loading chart…")
+                .font(.system(size: 13))
+                .foregroundColor(Color(white: 0.35))
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(red: 10/255, green: 10/255, blue: 10/255))
     }
 
     /// Compact Long / Short (perp) or Buy / Sell (spot) buttons pinned below the chart

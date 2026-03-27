@@ -83,15 +83,28 @@ final class LiquidationsViewModel: ObservableObject {
         startBackgroundPollingIfNeeded()
     }
 
-    // MARK: - Polling
+    // MARK: - Adaptive Polling
 
-    /// Poll every 6s while Liquidations screen is visible.
-    /// On return from off-screen: immediate delta fetch, then resume 6s polling.
-    /// Off-screen: slow background polling (45s) ONLY for notification checks if rules exist.
+    /// Base foreground interval (seconds). Ramps up when idle, resets on activity.
+    private static let baseInterval: TimeInterval = 8
+    private static let maxInterval: TimeInterval = 15
+    private static let intervalStep: TimeInterval = 2     // ramp: 8 → 10 → 12 → 15
+    private static let backgroundInterval: TimeInterval = 60
+    private var currentInterval: TimeInterval = baseInterval
+    /// Count of consecutive empty delta polls (no new items)
+    private var consecutiveEmptyPolls: Int = 0
+
+    /// Poll while Liquidations screen is visible (adaptive 8–15s).
+    /// On return from off-screen: immediate delta fetch, then resume polling.
+    /// Off-screen: completely stops polling (or 60s if notification rules exist).
     func startPolling() {
         let wasVisible = isViewVisible
         isViewVisible = true
         stopBackgroundPolling()
+
+        // Reset adaptive interval on screen open — user wants fresh data
+        currentInterval = Self.baseInterval
+        consecutiveEmptyPolls = 0
 
         // Immediate delta fetch on every return (catches events missed while away)
         Task { await fetch() }
@@ -101,36 +114,68 @@ final class LiquidationsViewModel: ObservableObject {
             Task { await fetchAllPerps() }
         }
 
-        guard pollTimer == nil else { return }
-        pollTimer = Timer.publish(every: 6, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                Task { await self?.fetch() }
-            }
-        print("[LIQ] Foreground polling started (6s)")
+        scheduleNextPoll()
+        print("[LIQ] Foreground polling started (\(Int(currentInterval))s adaptive)")
     }
 
     /// Stop foreground polling when leaving the screen.
-    /// Resumes slow background polling if notification rules exist.
+    /// Resumes slow background polling (60s) ONLY if notification rules exist.
     func stopPolling() {
         isViewVisible = false
         pollTimer?.cancel()
         pollTimer = nil
         startBackgroundPollingIfNeeded()
-        print("[LIQ] Foreground polling paused")
+        print("[LIQ] Foreground polling stopped")
     }
 
-    /// Background polling (45s) for notification checks — safety net while APNs push
+    /// Schedule the next adaptive poll. Called after each fetch completes.
+    private func scheduleNextPoll() {
+        pollTimer?.cancel()
+        guard isViewVisible else { return }
+        pollTimer = Timer.publish(every: currentInterval, on: .main, in: .common)
+            .autoconnect()
+            .first()    // single fire — reschedule after fetch
+            .sink { [weak self] _ in
+                Task {
+                    await self?.fetch()
+                    self?.scheduleNextPoll()
+                }
+            }
+    }
+
+    /// Adjust polling interval based on activity. Called after each delta fetch.
+    private func adaptInterval(newItemCount: Int) {
+        if newItemCount > 0 {
+            // Activity detected — snap back to base
+            consecutiveEmptyPolls = 0
+            if currentInterval != Self.baseInterval {
+                currentInterval = Self.baseInterval
+                print("[LIQ] ⚡ Activity detected, interval reset to \(Int(currentInterval))s")
+            }
+        } else {
+            // No new items — ramp up gradually
+            consecutiveEmptyPolls += 1
+            if consecutiveEmptyPolls >= 2 {
+                let next = min(currentInterval + Self.intervalStep, Self.maxInterval)
+                if next != currentInterval {
+                    currentInterval = next
+                    print("[LIQ] 💤 No activity (\(consecutiveEmptyPolls) empty), interval → \(Int(currentInterval))s")
+                }
+            }
+        }
+    }
+
+    /// Background polling (60s) for notification checks — safety net while APNs push
     /// is not yet fully reliable. Only runs when rules exist and view is hidden.
     private func startBackgroundPollingIfNeeded() {
         guard backgroundPollTimer == nil, !notificationRules.isEmpty else { return }
-        backgroundPollTimer = Timer.publish(every: 45, on: .main, in: .common)
+        backgroundPollTimer = Timer.publish(every: Self.backgroundInterval, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 guard let self, !self.isViewVisible else { return }
                 Task { await self.fetch() }
             }
-        print("[LIQ] Background polling started (45s, notification safety net)")
+        print("[LIQ] Background polling started (\(Int(Self.backgroundInterval))s, notification safety net)")
     }
 
     private func stopBackgroundPolling() {
@@ -195,7 +240,7 @@ final class LiquidationsViewModel: ObservableObject {
         newestTimestamp = 0
         var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
         var queryItems = filterQueryItems()
-        queryItems.append(URLQueryItem(name: "limit", value: "50"))
+        queryItems.append(URLQueryItem(name: "limit", value: "30"))
         components.queryItems = queryItems
         guard let url = components.url else { return }
 
@@ -238,7 +283,7 @@ final class LiquidationsViewModel: ObservableObject {
     }
 
     /// Delta poll — only fetches items newer than what we have.
-    /// Called by the 15s/30s timer. Small payload, no pagination.
+    /// Called by the adaptive timer. Small payload, no pagination.
     func fetch() async {
         // If no data yet, do a first page load instead
         guard newestTimestamp > 0 else {
@@ -249,13 +294,15 @@ final class LiquidationsViewModel: ObservableObject {
         var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
         var queryItems = filterQueryItems()
         queryItems.append(URLQueryItem(name: "since", value: String(Int64(newestTimestamp))))
-        queryItems.append(URLQueryItem(name: "limit", value: "50"))
+        queryItems.append(URLQueryItem(name: "limit", value: "30"))
         components.queryItems = queryItems
         guard let url = components.url else { return }
 
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             let response = try JSONDecoder().decode(LiquidationsResponse.self, from: data)
+
+            print("[LIQ] DELTA: received \(response.liquidations.count) items (\(data.count) bytes) interval=\(Int(currentInterval))s")
 
             checkNotifications(response.liquidations)
 
@@ -286,6 +333,9 @@ final class LiquidationsViewModel: ObservableObject {
             if let newest = liquidations.first?.timestamp, newest > newestTimestamp {
                 newestTimestamp = newest
             }
+
+            // Adapt polling interval based on activity
+            adaptInterval(newItemCount: toMerge.count)
         } catch {
             // Silently fail — will retry on next poll
         }
@@ -309,7 +359,7 @@ final class LiquidationsViewModel: ObservableObject {
         var components = URLComponents(string: "\(Self.backendBaseURL)/liquidations")!
         var queryItems = filterQueryItems()
         queryItems.append(URLQueryItem(name: "before", value: String(Int64(oldestTs))))
-        queryItems.append(URLQueryItem(name: "limit", value: "50"))
+        queryItems.append(URLQueryItem(name: "limit", value: "30"))
         components.queryItems = queryItems
         guard let url = components.url else { return }
 

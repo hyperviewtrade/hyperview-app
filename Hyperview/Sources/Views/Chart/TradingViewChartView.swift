@@ -2,19 +2,48 @@ import SwiftUI
 import WebKit
 import Combine
 
+// MARK: - Shared WKProcessPool (reuses WebKit process across all WKWebViews)
+// Eliminates ~50-100ms process spawn cost if any other WKWebView has already been created.
+private let sharedProcessPool = WKProcessPool()
+
+// MARK: - WebKit Process Pre-spawn
+
+enum WebKitWarmup {
+    /// Pre-spawn the WebKit content process during app startup.
+    /// Creates a minimal throwaway WKWebView that shares the chart's process pool.
+    /// The WebKit process stays alive for the pool's lifetime, saving ~50-100ms
+    /// on the first real WKWebView creation. The dummy is immediately released.
+    @MainActor
+    static func prespawn() {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let config = WKWebViewConfiguration()
+        config.processPool = sharedProcessPool
+        let _ = WKWebView(frame: .zero, configuration: config)
+        let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        print("[CHART-TIMING] WebKit process pre-spawned (\(ms)ms)")
+    }
+}
+
 // MARK: - TradingView Chart (WKWebView wrapper)
 
 struct TradingViewChartView: UIViewRepresentable {
     @EnvironmentObject var chartVM: ChartViewModel
 
     func makeUIView(context: Context) -> WKWebView {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        print("[CHART-TIMING] WEBVIEW CREATE START")
+
         let config = WKWebViewConfiguration()
+        config.processPool = sharedProcessPool
         config.allowsInlineMediaPlayback = true
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
         config.userContentController.add(context.coordinator, name: "tradingview")
 
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.isOpaque = false
+        // isOpaque = true with a dark backgroundColor is cheaper for compositing than
+        // transparent mode, and avoids the brief white flash — WebKit fills with bg
+        // color immediately. The skeleton overlay handles the loading appearance.
+        webView.isOpaque = true
         let bg = UIColor(red: 10/255, green: 10/255, blue: 10/255, alpha: 1)
         webView.backgroundColor = bg
         webView.scrollView.backgroundColor = bg
@@ -25,6 +54,10 @@ struct TradingViewChartView: UIViewRepresentable {
 
         context.coordinator.webView = webView
         context.coordinator.chartVM = chartVM
+        context.coordinator.coldStartT0 = t0
+
+        let createMs = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        print("[CHART-TIMING] WEBVIEW CREATE END (\(createMs)ms)")
 
         // Prefetch candles NOW — starts the API call immediately while WebView
         // parses 25MB of TradingView JS. By the time getBars fires, data is ready.
@@ -38,6 +71,7 @@ struct TradingViewChartView: UIViewRepresentable {
         // Load the HTML from TradingView subfolder (copied by build script)
         let tvDir = Bundle.main.bundleURL.appendingPathComponent("TradingView")
         let htmlURL = tvDir.appendingPathComponent("tradingview.html")
+        print("[CHART-TIMING] HTML LOAD START")
         webView.loadFileURL(htmlURL, allowingReadAccessTo: tvDir)
 
         return webView
@@ -89,6 +123,9 @@ struct TradingViewChartView: UIViewRepresentable {
         // Track current WS subscription
         private var subscribedSymbol: String?
         private var subscribedInterval: String?
+
+        /// Timestamp of makeUIView — used for cold-start timing logs
+        var coldStartT0: CFAbsoluteTime = 0
 
         // MARK: - Candle Prefetch
         // Single shared Task per symbol — getBars awaits it instead of making a 2nd request.
@@ -156,10 +193,39 @@ struct TradingViewChartView: UIViewRepresentable {
             return candles
         }
 
+        /// Early prefetch: warms the static candle cache before the chart view is ever created.
+        /// Call during app startup to eliminate the REST wait on first chart open.
+        /// Safe to call from anywhere — writes to the same static cache that getBars reads.
+        static func earlyPrefetch(symbol: String, interval: ChartInterval) {
+            let key = "\(symbol):\(interval.rawValue)"
+            guard candleCache[key] == nil else { return }
+
+            Task {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                do {
+                    let candles = try await HyperliquidAPI.shared.fetchCandles(coin: symbol, interval: interval)
+                    if candleCache.count >= maxCacheEntries {
+                        let oldest = candleCache.min(by: { $0.value.date < $1.value.date })
+                        if let k = oldest?.key { candleCache.removeValue(forKey: k) }
+                    }
+                    candleCache[key] = (candles, Date())
+                    let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+                    print("[CHART] Early prefetch done: \(symbol):\(interval.rawValue) (\(candles.count) candles, \(ms)ms)")
+                } catch {
+                    print("[CHART] Early prefetch failed: \(error.localizedDescription)")
+                }
+            }
+        }
+
         // MARK: - WKNavigationDelegate
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             guard let vm = chartVM else { return }
+            if coldStartT0 > 0 {
+                let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - coldStartT0) * 1000)
+                print("[CHART-TIMING] HTML LOAD END (+\(ms)ms from create)")
+            }
+
             let symbol = vm.selectedSymbol
             currentSymbol = symbol
             let isCustom = vm.isCustomTVChart
@@ -167,6 +233,9 @@ struct TradingViewChartView: UIViewRepresentable {
 
             let interval = Self.hlIntervalToTV(vm.selectedInterval)
             let js = "initChart('\(Self.escapeJS(symbol))', '\(interval)', 'dark', \(isCustom));"
+            if coldStartT0 > 0 {
+                print("[CHART-TIMING] TradingView INIT START")
+            }
             webView.evaluateJavaScript(js)
         }
 
@@ -184,12 +253,30 @@ struct TradingViewChartView: UIViewRepresentable {
             switch type {
             case "chartReady":
                 isChartReady = true
+                let isColdStart = coldStartT0 > 0
+                if isColdStart {
+                    let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - coldStartT0) * 1000)
+                    print("[CHART-TIMING] CHART READY / FIRST VISIBLE PAINT (+\(ms)ms from create)")
+                    coldStartT0 = 0 // only log cold start once
+                }
+                chartVM?.isChartReady = true
                 startLivePriceLineUpdates()
+                if isColdStart {
+                    print("[CHART-TIMING] LIVE LINE READY")
+                }
 
             case "resolveSymbol":
+                if coldStartT0 > 0 {
+                    let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - coldStartT0) * 1000)
+                    print("[CHART-TIMING] resolveSymbol START (+\(ms)ms from create)")
+                }
                 handleResolveSymbol(json, requestId: requestId)
 
             case "getBars":
+                if coldStartT0 > 0 {
+                    let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - coldStartT0) * 1000)
+                    print("[CHART-TIMING] getBars START (+\(ms)ms from create)")
+                }
                 handleGetBars(json, requestId: requestId)
 
             case "subscribeBars":
@@ -214,14 +301,11 @@ struct TradingViewChartView: UIViewRepresentable {
             if isCustom {
                 handleResolveSymbolExternal(symbol, requestId: requestId)
             } else {
-                // Run async so we can await prefetched candles for accurate pricescale
-                Task { @MainActor in
-                    await handleResolveSymbolHL(symbol, requestId: requestId)
-                }
+                handleResolveSymbolHL(symbol, requestId: requestId)
             }
         }
 
-        private func handleResolveSymbolHL(_ symbol: String, requestId: Int) async {
+        private func handleResolveSymbolHL(_ symbol: String, requestId: Int) {
             let vm = chartVM
             let interval = vm?.selectedInterval ?? .oneHour
 
@@ -230,34 +314,73 @@ struct TradingViewChartView: UIViewRepresentable {
             // during changeSymbol, which would give completely wrong pricescale.
 
             var referencePrice: Double = 0
+            var priceSource = "fallback"
 
             // 1. Candle cache — keyed by exact symbol, always correct
             if referencePrice == 0 {
                 let key = "\(symbol):\(interval.rawValue)"
-                referencePrice = Self.candleCache[key]?.candles.last?.close ?? 0
-            }
-
-            // 2. Await in-flight prefetch for THIS symbol — guarantees correct data
-            if referencePrice == 0, let prefetch = activePrefetch, prefetch.key.hasPrefix("\(symbol):") {
-                if let candles = try? await prefetch.task.value, let last = candles.last {
-                    referencePrice = last.close
+                if let cached = Self.candleCache[key]?.candles.last?.close, cached > 0 {
+                    referencePrice = cached
+                    priceSource = "candleCache[\(key)]"
                 }
             }
 
-            // 3. Only use vm.candles if the symbol matches (not stale from previous)
-            if referencePrice == 0, vm?.selectedSymbol == symbol {
-                referencePrice = vm?.candles.last?.close ?? 0
+            // 2. WebSocket allMids — fresh price for main-DEX perps
+            if referencePrice == 0 {
+                let mids = WebSocketManager.shared.latestMidPrices
+                if let midPrice = mids[symbol], midPrice > 0 {
+                    referencePrice = midPrice
+                    priceSource = "allMids[\(symbol)]"
+                }
             }
 
-            // Compute pricescale using 5 significant figures — matches header display
-            let priceDecimals: Int
-            if referencePrice > 0 {
-                priceDecimals = Market.sigFigDecimals(referencePrice)
-            } else {
-                // No price available yet — use 2 as safe default
-                priceDecimals = 2
+            // 3. MarketsViewModel.markPriceCache — covers ALL markets including HIP-3.
+            // allMids only covers main-DEX perps. HIP-3 prices are seeded from market
+            // context in publishMarkets(), keyed by market.symbol (e.g. "xyz:SILVER").
+            if referencePrice == 0 {
+                let cache = MarketsViewModel.markPriceCache
+                let cached = cache[symbol] ?? 0
+                if cached > 0 {
+                    referencePrice = cached
+                    priceSource = "markPriceCache[\(symbol)]"
+                } else {
+                    // Diagnostic: show what keys ARE in markPriceCache for this coin
+                    let baseName = symbol.split(separator: ":").last.map(String.init) ?? symbol
+                    let nearbyKeys = cache.keys.filter { $0.lowercased().contains(baseName.lowercased()) }
+                    print("[CHART-PRICE] markPriceCache MISS key=\(symbol) | cache.count=\(cache.count) | nearby=\(nearbyKeys.sorted()) | values=\(nearbyKeys.sorted().map { "\($0)=\(cache[$0] ?? 0)" })")
+                }
             }
-            let pricescale = Int(pow(10.0, Double(priceDecimals)))
+
+            // Visual price-bucket rule for TradingView Y-axis precision.
+            // NOTE: This is intentionally separate from header formatting (sigFigDecimals,
+            // capped at 6). The chart Y-axis needs more precision for very low-price assets
+            // like NEKO where Hyperliquid shows up to 8 decimals on the axis.
+            //   >= 10000   → 0 decimals  (BTC 97000, XYZ100 23714)
+            //   >= 1000    → 1 decimal   (ETH 1800.0, GOLD 3300.0)
+            //   >= 100     → 2 decimals  (SOL 145.00)
+            //   >= 1       → 3 decimals  (HYPE 21.000, SILVER 69.584, WTIOIL 62.000)
+            //   >= 0.01    → 4 decimals  (low-price tokens)
+            //   >= 0.01 is handled above
+            //   < 0.01     → 8 decimals  (very low-price spot/micro-cap like NEKO ~0.0006)
+            let pricescale: Int
+            if referencePrice >= 10000 {
+                pricescale = 1            // 0 decimals
+            } else if referencePrice >= 1000 {
+                pricescale = 10           // 1 decimal
+            } else if referencePrice >= 100 {
+                pricescale = 100          // 2 decimals
+            } else if referencePrice >= 1 {
+                pricescale = 1000         // 3 decimals
+            } else if referencePrice >= 0.01 {
+                pricescale = 10000        // 4 decimals
+            } else if referencePrice > 0 {
+                pricescale = 100000000    // 8 decimals
+            } else {
+                pricescale = 100          // fallback: 2 decimals
+            }
+            let priceDecimals = Int(log10(Double(pricescale)))
+
+            print("[CHART-PRICE] symbol=\(symbol) source=\(priceSource) refPrice=\(referencePrice) decimals=\(priceDecimals) pricescale=\(pricescale)")
 
             let displayName = vm?.displayName ?? symbol
             let info: [String: Any] = [
@@ -266,7 +389,10 @@ struct TradingViewChartView: UIViewRepresentable {
                 "type": "crypto",
                 "pricescale": pricescale
             ]
-            print("[CHART] resolveSymbol \(symbol) refPrice=\(referencePrice) decimals=\(priceDecimals) pricescale=\(pricescale)")
+            if coldStartT0 > 0 {
+                let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - coldStartT0) * 1000)
+                print("[CHART-TIMING] resolveSymbol END (+\(ms)ms from create)")
+            }
             resolveJSRequest(requestId, data: info)
         }
 
@@ -440,9 +566,26 @@ struct TradingViewChartView: UIViewRepresentable {
                         candles = Array(candles.suffix(countBack))
                     }
 
+                    // Log first bar raw vs mapped for precision diagnosis
+                    if let first = candles.first {
+                        print("[CHART-BARS] \(symbol) raw o=\(first.o) c=\(first.c) h=\(first.h) l=\(first.l) | Double o=\(first.open) c=\(first.close) h=\(first.high) l=\(first.low)")
+                    }
+
+                    // Use raw String values parsed to NSDecimalNumber to preserve full
+                    // API precision through JSONSerialization. Double round-trip can lose
+                    // trailing digits (e.g. "69.743" → 69.74299… → serializes as "69.743"
+                    // sometimes but "69.74" in edge cases). NSDecimalNumber avoids this.
                     let bars: [[String: Any]] = candles.map { c in
-                        ["time": c.t, "open": c.open, "high": c.high,
-                         "low": c.low, "close": c.close, "volume": c.volume]
+                        ["time": c.t,
+                         "open":   NSDecimalNumber(string: c.o),
+                         "high":   NSDecimalNumber(string: c.h),
+                         "low":    NSDecimalNumber(string: c.l),
+                         "close":  NSDecimalNumber(string: c.c),
+                         "volume": NSDecimalNumber(string: c.v)]
+                    }
+                    if self.coldStartT0 > 0 {
+                        let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - self.coldStartT0) * 1000)
+                        print("[CHART-TIMING] getBars END (\(candles.count) bars, +\(ms)ms from create)")
                     }
                     self.resolveJSRequest(requestId, data: ["bars": bars, "noData": candles.isEmpty])
                 } catch {
@@ -1410,6 +1553,10 @@ struct TradingViewChartView: UIViewRepresentable {
         func changeSymbol(_ symbol: String, interval: ChartInterval, isCustom: Bool = false) {
             // Reset price line for new symbol
             previousLivePrice = 0
+            // NOTE: Do NOT reset isChartReady here. TradingView's chartReady callback
+            // fires only once on initial widget creation (initChart). changeSymbol()
+            // switches the symbol internally without re-emitting chartReady.
+            // Resetting it here would leave the skeleton permanently visible.
 
             // Prefetch candles immediately — runs in parallel with TV's symbol switch animation
             if !isCustom {
