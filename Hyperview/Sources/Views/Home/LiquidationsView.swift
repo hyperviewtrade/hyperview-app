@@ -41,12 +41,6 @@ struct LiquidationsView: View {
                                 liquidationRow(liq)
                             }
                             .padding(.horizontal, 14)
-                            // Auto-load more when approaching the bottom (infinite scroll)
-                            .onAppear {
-                                if liq.id == vm.liquidations.last?.id, vm.hasMore, !vm.isLoadingMore {
-                                    Task { await vm.loadMore() }
-                                }
-                            }
                         }
 
                         // Load More indicator / manual button
@@ -204,18 +198,9 @@ struct LiquidationsView: View {
                 }
             }
 
-            // Size filter (collapsible)
+            // Max size filter (collapsible)
             if showFilters {
                 HStack(spacing: 8) {
-                    // Min size is server-enforced — show as label
-                    Text(">= $1,000")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(Color(white: 0.45))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(Color(white: 0.09))
-                        .cornerRadius(8)
-
                     sizeField("Max $", text: $vm.maxSize)
                         .focused($maxSizeFieldFocused)
 

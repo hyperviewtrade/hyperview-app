@@ -7,6 +7,7 @@ struct TWAPView: View {
     @EnvironmentObject var marketsVM: MarketsViewModel
     @State private var progressTick = false  // triggers progress bar redraws
     @State private var showCoinPicker = false
+    @State private var displayLimit = 30     // client-side pagination
 
     let progressTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -188,24 +189,61 @@ struct TWAPView: View {
                     .foregroundColor(Color(white: 0.5))
                 Spacer()
             } else {
+                let allOrders = vm.filteredOrders
+                let visibleOrders = Array(allOrders.prefix(displayLimit))
+                let hasMoreOrders = allOrders.count > displayLimit
+
                 ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         Color.clear.frame(height: 0).id("twapTop")
-                        ForEach(vm.filteredOrders) { order in
+                        ForEach(visibleOrders) { order in
                             twapRow(order)
                                 .padding(.horizontal, 14)
+                        }
+
+                        // Load More button — explicit user-triggered pagination
+                        if hasMoreOrders {
+                            Button {
+                                displayLimit += 30
+                            } label: {
+                                HStack {
+                                    Spacer()
+                                    Text("Load More (\(visibleOrders.count) of \(allOrders.count))")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundColor(.hlGreen)
+                                    Spacer()
+                                }
+                                .padding(.vertical, 12)
+                                .background(Color(white: 0.09))
+                                .cornerRadius(10)
+                                .padding(.horizontal, 14)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        // Bottom status
+                        if !hasMoreOrders && !visibleOrders.isEmpty {
+                            Text("\(allOrders.count) orders")
+                                .font(.system(size: 11))
+                                .foregroundColor(Color(white: 0.3))
+                                .padding(.vertical, 8)
                         }
                     }
                     .padding(.top, 4)
                     .padding(.bottom, 20)
                 }
                 .refreshable {
+                    displayLimit = 30  // reset pagination on refresh
                     await vm.refresh()
                 }
                 .onChange(of: appState.homeReselect) { _, _ in
                     withAnimation { proxy.scrollTo("twapTop", anchor: .top) }
                 }
+                .onChange(of: vm.marketFilter) { _, _ in displayLimit = 30 }
+                .onChange(of: vm.perpSubFilter) { _, _ in displayLimit = 30 }
+                .onChange(of: vm.selectedCoin) { _, _ in displayLimit = 30 }
+                .onChange(of: vm.sortOption) { _, _ in displayLimit = 30 }
                 }
             }
         }

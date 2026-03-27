@@ -188,7 +188,8 @@ final class LiquidationsViewModel: ObservableObject {
             let response = try JSONDecoder().decode(LiquidationsResponse.self, from: data)
 
             checkNotifications(response.liquidations)
-            liquidations = response.liquidations
+            // Backend returns sorted newest-first, but verify
+            liquidations = response.liquidations.sorted { $0.timestamp > $1.timestamp }
             totalFiltered = response.total ?? response.liquidations.count
 
             if let newest = liquidations.first?.timestamp {
@@ -198,9 +199,10 @@ final class LiquidationsViewModel: ObservableObject {
                 availableCoins = ["All"] + coins
             }
 
-            let minUSD = liquidations.map(\.sizeUSD).min() ?? 0
-            let maxUSD = liquidations.map(\.sizeUSD).max() ?? 0
-            print("[LIQ] FIRST PAGE: count=\(liquidations.count) total=\(totalFiltered) hasMore=\(hasMore) minUSD=\(minUSD) maxUSD=\(maxUSD)")
+            let firstTs = liquidations.first?.timestamp ?? 0
+            let lastTs = liquidations.last?.timestamp ?? 0
+            let isSorted = zip(liquidations, liquidations.dropFirst()).allSatisfy { $0.timestamp >= $1.timestamp }
+            print("[LIQ] FIRST PAGE: count=\(liquidations.count) total=\(totalFiltered) firstTS=\(Int64(firstTs)) lastTS=\(Int64(lastTs)) sorted=\(isSorted)")
         } catch {
             print("[LIQ] FIRST PAGE DECODE ERROR: \(error)")
         }
@@ -229,12 +231,13 @@ final class LiquidationsViewModel: ObservableObject {
             checkNotifications(response.liquidations)
 
             if !response.liquidations.isEmpty {
-                // Prepend new items at the top, dedup by id
+                // Merge new items, dedup by id, re-sort globally newest-first
                 let existingIds = Set(liquidations.map(\.id))
                 let fresh = response.liquidations.filter { !existingIds.contains($0.id) }
                 if !fresh.isEmpty {
-                    liquidations = fresh + liquidations
+                    liquidations = (fresh + liquidations).sorted { $0.timestamp > $1.timestamp }
                     totalFiltered += fresh.count
+                    print("[LIQ] DELTA: +\(fresh.count) new, total=\(liquidations.count)")
                 }
             }
 
@@ -278,7 +281,13 @@ final class LiquidationsViewModel: ObservableObject {
                 let existingIds = Set(liquidations.map(\.id))
                 let older = response.liquidations.filter { !existingIds.contains($0.id) }
                 liquidations.append(contentsOf: older)
+                // Re-sort globally to maintain strict newest-first order
+                liquidations.sort { $0.timestamp > $1.timestamp }
                 print("[LIQ] LOAD MORE APPENDED: \(older.count) new items, total=\(liquidations.count)")
+            }
+            // Update totalFiltered from server response
+            if let serverTotal = response.total {
+                totalFiltered = max(serverTotal, liquidations.count)
             }
             // Stop pagination if server returned fewer items than requested (end of data)
             if response.liquidations.count < 30 {
