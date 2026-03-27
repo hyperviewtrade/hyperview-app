@@ -97,7 +97,7 @@ final class TrackSearchViewModel: ObservableObject {
     @Published var hasMore = false
 
     private var currentOffset = 0
-    private static let pageSize = 100
+    private static let pageSize = 30
 
     private static let backendBaseURL = "https://hyperview-backend-production-075c.up.railway.app"
 
