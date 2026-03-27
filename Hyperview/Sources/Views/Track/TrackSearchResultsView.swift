@@ -68,10 +68,13 @@ struct TrackSearchResultsView: View {
             CopyTradeSheet(position: pos, market: market, alias: aliases[pos.address.lowercased()])
         }
         .task {
-            await loadAliases()
             // Only fetch the default tab on first appear
             guard notLarpsVM.results.isEmpty else { return }
-            await performSearch(for: .notLarps, reset: true)
+
+            // Run aliases + search concurrently — don't block results on alias fetch
+            async let aliasTask: Void = loadAliases()
+            async let searchTask: Void = performSearch(for: .notLarps, reset: true)
+            _ = await (aliasTask, searchTask)
 
             // Prefetch the other tab's first page in background so tab switch is instant.
             // Guards: only if the other VM has no results and isn't already loading.

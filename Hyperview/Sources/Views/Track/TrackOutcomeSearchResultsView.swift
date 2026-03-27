@@ -97,9 +97,11 @@ struct TrackOutcomeSearchResultsView: View {
         .navigationTitle(question.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            await loadAliases()
             guard allTrades.isEmpty else { return }
-            await fetchTrades()
+            // Run aliases + fetch concurrently — don't block results on alias fetch
+            async let aliasTask: Void = loadAliases()
+            async let fetchTask: Void = fetchTrades()
+            _ = await (aliasTask, fetchTask)
         }
         .navigationDestination(isPresented: Binding(
             get: { walletToShow != nil },
