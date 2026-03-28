@@ -114,7 +114,7 @@ struct PositionDetailSheet: View {
 
     private var positionHeader: some View {
         HStack(spacing: 10) {
-            CoinIconView(symbol: position.coin, hlIconName: position.coin, iconSize: 32)
+            CoinIconView(symbol: position.coin, hlIconName: position.rawCoin, iconSize: 32)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(position.coin)

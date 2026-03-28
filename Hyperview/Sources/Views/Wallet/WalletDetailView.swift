@@ -542,7 +542,7 @@ struct WalletDetailView: View {
     private func perpRow(_ pos: PerpPosition) -> some View {
         VStack(spacing: 8) {
             HStack {
-                CoinIconView(symbol: pos.coin, hlIconName: pos.coin, iconSize: 24)
+                CoinIconView(symbol: pos.coin, hlIconName: pos.rawCoin, iconSize: 24)
                 Text(pos.coin)
                     .font(.system(size: 15, weight: .bold))
                     .foregroundColor(.hlGreen)

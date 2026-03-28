@@ -119,9 +119,6 @@ struct HomeRelativePerformanceCard: View {
     private func formatPct(_ value: Double) -> String {
         let pct = value * 100
         let sign = pct >= 0 ? "+" : ""
-        if abs(pct) >= 1000 {
-            return "\(sign)\(String(format: "%.0f", pct))%"
-        }
         return "\(sign)\(String(format: "%.2f", pct))%"
     }
 }

@@ -312,12 +312,15 @@ struct HomeView: View {
         }
         .onAppear { homeScrollProxy = proxy }
         .refreshable {
+            // Lightweight refresh: wallet/account balance + earn state (fast, reliable)
+            // TWAP and other heavy data refresh on their own background cycles
             if isPhantomActive {
                 await loadPhantomBalance()
             } else {
                 await wallet.refreshAccountState()
+                // Also refresh earn data so PM-related views update
+                await earnVM.load()
             }
-            await twapVM.refresh()
         }
         .task(id: phantomAddress) {
             if isPhantomActive {
@@ -367,10 +370,13 @@ struct HomeView: View {
         }()
         let balance: Double = {
             if isPhantomActive { return phantomBalance }
-            if earnVM.portfolioMarginEnabled {
-                return earnVM.spotAccountValue
-            }
             return wallet.accountValue
+        }()
+        // Show "--" if the stored accountValue belongs to a different address
+        let balanceStale: Bool = {
+            if isPhantomActive { return false }
+            guard let current = wallet.connectedWallet?.address else { return false }
+            return wallet.accountValueAddress != current
         }()
         let pnl     = isPhantomActive ? phantomPnl : wallet.dailyPnl
         let denom   = balance - pnl
@@ -413,18 +419,26 @@ struct HomeView: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(Color(white: 0.5))
 
-                Text(formatUSD(balance))
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
+                if balanceStale {
+                    Text("--")
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
+                        .foregroundColor(Color(white: 0.3))
+                } else {
+                    Text(formatUSD(balance))
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                }
 
                 // Daily PnL
-                HStack(spacing: 4) {
-                    Text("PNL (24h) :")
-                    Text(pnl >= 0 ? "+\(formatUSD(pnl))" : formatUSD(pnl))
-                    Text("(\(String(format: "%+.2f%%", pnlPct)))")
+                if !balanceStale {
+                    HStack(spacing: 4) {
+                        Text("PNL (24h) :")
+                        Text(pnl >= 0 ? "+\(formatUSD(pnl))" : formatUSD(pnl))
+                        Text("(\(String(format: "%+.2f%%", pnlPct)))")
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(pnl >= 0 ? .hlGreen : .red)
                 }
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(pnl >= 0 ? .hlGreen : .red)
             }
 
             // Action buttons

@@ -6,6 +6,7 @@ import Combine
 struct PerpPosition: Identifiable {
     let id = UUID()
     let coin: String
+    let rawCoin: String        // original API name, e.g. "dex:GOLD" for HIP-3 (used for icon CDN)
     let size: Double           // positive = long, negative = short
     let entryPrice: Double
     let markPrice: Double
@@ -584,13 +585,14 @@ final class WalletDetailViewModel: ObservableObject {
     }
 
     /// Fallback: progressive HL API loading.
-    /// Phase 1: positions + orders (instant display)
-    /// Phase 2: spot + fills, staking, HIP-3 (background)
+    /// Phase 1: positions + orders + HIP-3 (instant display)
+    /// Phase 2: spot + fills, staking (background)
     private func loadFromHLAPI(address: String) async {
-        // ── Phase 1: positions + orders (first render) ──
+        // ── Phase 1: positions + HIP-3 + orders (first render) ──
         do {
-            print("⏱ [\(elapsed())] HLAPI PHASE1 START (state + spot + midPrices)")
+            print("⏱ [\(elapsed())] HLAPI PHASE1 START (state + hip3 + spot + midPrices)")
             async let stateTask = api.fetchUserState(address: address)
+            async let hip3Task  = api.fetchHIP3States(address: address)
             async let spotTask  = api.fetchSpotState(address: address)
             async let midTask: () = fetchMidPrices()
 
@@ -605,6 +607,14 @@ final class WalletDetailViewModel: ObservableObject {
 
             parsePositions(from: state)
             print("⏱ [\(elapsed())] HLAPI PARSE POSITIONS END  count=\(positions.count)")
+
+            // Await HIP-3 (started in parallel with state, so often already resolved)
+            let hip3 = await hip3Task
+            for (_, dexState) in hip3 {
+                parseHIP3Positions(from: dexState)
+            }
+            print("⏱ [\(elapsed())] HLAPI PARSE HIP3 END  count=\(positions.count)")
+
             hasFetched = true
             print("⏱ [\(elapsed())] ✅ hasFetched = true (UI can render)")
 
@@ -627,7 +637,7 @@ final class WalletDetailViewModel: ObservableObject {
                 self.computeOverview()
                 print("⏱ [\(self.elapsed())] HLAPI SPOT DONE")
 
-                // Fills + ledger + staking + HIP-3
+                // Fills + ledger + staking (HIP-3 already loaded in Phase 1)
                 await self.loadSecondaryData(address: capturedAddress)
 
                 self.finishLoading(cacheKey: capturedAddress.lowercased())
@@ -638,7 +648,8 @@ final class WalletDetailViewModel: ObservableObject {
         }
     }
 
-    /// Load fills, ledger, staking, HIP-3 after positions are displayed.
+    /// Load fills, ledger, staking after positions are displayed.
+    /// (HIP-3 positions are now fetched in Phase 1, not here.)
     private func loadSecondaryData(address: String) async {
         // Fetch validator names if not cached yet
         if Self.validatorNames == nil {
@@ -670,15 +681,6 @@ final class WalletDetailViewModel: ObservableObject {
         let delegs   = await delegTask ?? []
         let rewards  = await rewardsTask ?? []
 
-        // Small delay before HIP-3 (which itself makes multiple calls)
-        try? await Task.sleep(nanoseconds: 300_000_000)
-
-        // HIP-3 positions (sequential inside)
-        let hip3 = await api.fetchHIP3States(address: address)
-
-        for (_, dexState) in hip3 {
-            parseHIP3Positions(from: dexState)
-        }
         parseStaking(summary: stakeSum, delegations: delegs, rewards: rewards)
         // Cache writing + isLoading=false handled by finishLoading() in the caller.
     }
@@ -886,6 +888,7 @@ final class WalletDetailViewModel: ObservableObject {
 
             return PerpPosition(
                 coin: coin,
+                rawCoin: coin,
                 size: szi,
                 entryPrice: entry,
                 markPrice: mark / max(abs(szi), 0.000001),
@@ -928,6 +931,7 @@ final class WalletDetailViewModel: ObservableObject {
 
             return PerpPosition(
                 coin: displayCoin,
+                rawCoin: coin,
                 size: szi,
                 entryPrice: entry,
                 markPrice: mark / max(abs(szi), 0.000001),

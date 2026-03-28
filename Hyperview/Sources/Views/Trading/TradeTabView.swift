@@ -918,7 +918,7 @@ struct TradeTabView: View {
         }
         let maxVal: Double
         if isSpotMarket && tradingVM.side == .sell {
-            let tokenBal = walletMgr.spotTokenBalances[spotBaseCoin] ?? 0
+            let tokenBal = walletMgr.spotTokenAvailable[spotBaseCoin] ?? 0
             guard tokenBal > 0 else { return }
             if sizeInToken {
                 maxVal = tokenBal
@@ -1024,8 +1024,8 @@ struct TradeTabView: View {
     private func applySizePct(_ pct: Double) {
         let szDec = tradingVM.szDecimals
         if isSpotMarket && tradingVM.side == .sell {
-            // Sell spot: use TOTAL token balance (not available) — user expects 100% = all
-            let tokenBal = walletMgr.spotTokenBalances[spotBaseCoin] ?? 0
+            // Sell spot: use AVAILABLE token balance (total - hold) to avoid insufficient balance errors
+            let tokenBal = walletMgr.spotTokenAvailable[spotBaseCoin] ?? 0
             let raw = tokenBal * pct / 100.0
             let factor = pow(10.0, Double(szDec))
             let tokenAmount = floor(raw * factor) / factor
@@ -1356,6 +1356,7 @@ struct TradeTabView: View {
     @State private var pmAvailableToTrade: Double = 0 // tokenToAvailableAfterMaintenance for USDC
     @State private var showRepaySheet = false
     @State private var repayEntry: PMBalanceEntry?
+    @State private var hideSmallBalances = false
 
     struct PMBalanceEntry: Identifiable {
         let id = UUID()
@@ -1394,28 +1395,44 @@ struct TradeTabView: View {
 
     // Classic balances (non-PM)
     private var classicBalancesView: some View {
-        let entries = classicBalanceEntries
+        let allEntries = classicBalanceEntries
+        let entries = hideSmallBalances ? allEntries.filter { classicEntryUSDValue($0) >= 1.0 } : allEntries
 
         return VStack(spacing: 0) {
-            // Header
-            HStack(spacing: 0) {
-                Text("Coin").frame(width: 65, alignment: .leading)
-                Text("Total Balance").frame(maxWidth: .infinity, alignment: .trailing)
-                Text("Available Balance").frame(maxWidth: .infinity, alignment: .trailing)
-                Text("USDC Value").frame(width: 80, alignment: .trailing)
-            }
-            .font(.system(size: 10))
-            .foregroundColor(Color(white: 0.45))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(spacing: 0) {
+                    // Header
+                    HStack(spacing: 0) {
+                        Text("Coin").frame(width: 72, alignment: .leading)
+                        Text("Total").frame(width: 88, alignment: .trailing)
+                        Text("Available").frame(width: 88, alignment: .trailing)
+                        Text("USDC Value").frame(width: 75, alignment: .trailing)
+                        Text("PnL").frame(width: 100, alignment: .trailing)
+                    }
+                    .font(.system(size: 10))
+                    .foregroundColor(Color(white: 0.45))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
 
-            ForEach(entries, id: \.coin) { entry in
-                classicBalanceRow(entry)
-                    .contentShape(Rectangle())
-                    .onTapGesture { openSpotMarket(for: entry.coin) }
-                Divider().background(Color(white: 0.1))
+                    ForEach(entries, id: \.coin) { entry in
+                        classicBalanceRow(entry)
+                            .contentShape(Rectangle())
+                            .onTapGesture { openSpotMarket(for: entry.coin) }
+                        Divider().background(Color(white: 0.1))
+                    }
+                }
+                .frame(minWidth: 423)
             }
+
+            // Hide small balances toggle
+            hideSmallBalancesToggle
         }
+    }
+
+    /// USD value for a classic balance entry (for filtering)
+    private func classicEntryUSDValue(_ entry: (coin: String, total: Double, available: Double)) -> Double {
+        let price = tokenPrice(for: entry.coin)
+        return entry.total * price
     }
 
     private var classicBalanceEntries: [(coin: String, total: Double, available: Double)] {
@@ -1444,9 +1461,14 @@ struct TradeTabView: View {
     private func classicBalanceRow(_ entry: (coin: String, total: Double, available: Double)) -> some View {
         let price = tokenPrice(for: entry.coin)
         let usdValue = entry.total * price
-        let stables = ["USDC", "USDH", "USDT", "USDE"]
+        let stables = ["USDC", "USDH", "USDT", "USDE", "USDT0"]
         let isStable = stables.contains(entry.coin)
         let decimals = isStable ? 2 : (entry.coin == "BTC" || entry.coin == "UBTC" ? 5 : 4)
+
+        // PnL: current USD value - entry notional (cost basis)
+        let entryNtl = walletMgr.spotTokenEntryNtl[entry.coin] ?? 0
+        let pnlDollar = isStable ? 0 : (usdValue - entryNtl)
+        let pnlPct = entryNtl > 0 ? (pnlDollar / entryNtl) * 100 : 0
 
         return HStack(spacing: 0) {
             HStack(spacing: 5) {
@@ -1454,27 +1476,43 @@ struct TradeTabView: View {
                 Text(entry.coin)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(isStable ? .white : .hlGreen)
+                    .lineLimit(1)
             }
-            .frame(width: 65, alignment: .leading)
+            .frame(width: 72, alignment: .leading)
 
-            Text(formatBalance(entry.total, coin: entry.coin, decimals: decimals))
+            Text(String(format: "%.\(decimals)f", entry.total))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(Color(white: 0.6))
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                .frame(width: 88, alignment: .trailing)
                 .lineLimit(1)
 
-            Text(formatBalance(entry.available, coin: entry.coin, decimals: decimals))
+            Text(String(format: "%.\(decimals)f", entry.available))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(Color(white: 0.6))
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                .frame(width: 88, alignment: .trailing)
                 .lineLimit(1)
 
             Text(usdValue >= 0.01
                  ? String(format: "$%.2f", usdValue)
                  : "$0.00")
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.white)
-                .frame(width: 80, alignment: .trailing)
+                .frame(width: 75, alignment: .trailing)
+
+            // PnL column
+            if isStable || entryNtl == 0 {
+                Text("-")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(Color(white: 0.4))
+                    .frame(width: 100, alignment: .trailing)
+            } else {
+                let sign = pnlDollar >= 0 ? "+" : ""
+                Text("\(sign)\(String(format: "$%.2f", pnlDollar)) (\(sign)\(String(format: "%.2f", pnlPct))%)")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(pnlDollar >= 0 ? .hlGreen : .tradingRed)
+                    .frame(width: 100, alignment: .trailing)
+                    .lineLimit(1)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -1525,7 +1563,9 @@ struct TradeTabView: View {
 
     // PM balances (Portfolio Margin)
     private var pmBalancesView: some View {
-        VStack(spacing: 0) {
+        let filteredPM = hideSmallBalances ? pmBalances.filter { abs($0.usdcValue) >= 1.0 } : pmBalances
+
+        return VStack(spacing: 0) {
             if pmBalances.isEmpty {
                 if pmBalancesLoaded {
                     emptyTabView("No balances")
@@ -1535,17 +1575,25 @@ struct TradeTabView: View {
                         .padding(.vertical, 16)
                 }
             } else {
-                // Column headers
-                pmColumnHeaders
-                Divider().background(Color(white: 0.15))
+                ScrollView(.horizontal, showsIndicators: false) {
+                    VStack(spacing: 0) {
+                        // Column headers
+                        pmColumnHeaders
+                        Divider().background(Color(white: 0.15))
 
-                ForEach(pmBalances) { entry in
-                    pmBalanceRow(entry)
-                    Divider().background(Color(white: 0.08))
+                        ForEach(filteredPM) { entry in
+                            pmBalanceRow(entry)
+                            Divider().background(Color(white: 0.08))
+                        }
+                    }
+                    .frame(minWidth: 413)
                 }
 
-                // Repay buttons below
+                // Repay buttons below (outside horizontal scroll)
                 pmRepayButtons
+
+                // Hide small balances toggle
+                hideSmallBalancesToggle
             }
         }
         .sheet(isPresented: $showRepaySheet) {
@@ -1562,18 +1610,20 @@ struct TradeTabView: View {
     private var pmColumnHeaders: some View {
         HStack(spacing: 4) {
             Text("Coin")
-                .frame(width: 55, alignment: .leading)
+                .frame(width: 68, alignment: .leading)
             Text("LTV")
-                .frame(width: 32, alignment: .trailing)
+                .frame(width: 35, alignment: .trailing)
             Text("Borrow\nCap Used")
-                .frame(width: 40, alignment: .trailing)
+                .frame(width: 50, alignment: .trailing)
                 .multilineTextAlignment(.trailing)
             Text("Net Balance")
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            Text("Available")
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            Text("Value")
-                .frame(width: 58, alignment: .trailing)
+                .frame(width: 80, alignment: .trailing)
+            Text("Available\nBalance")
+                .frame(width: 80, alignment: .trailing)
+                .multilineTextAlignment(.trailing)
+            Text("USDC\nValue")
+                .frame(width: 65, alignment: .trailing)
+                .multilineTextAlignment(.trailing)
         }
         .font(.system(size: 9, weight: .medium))
         .foregroundColor(.gray)
@@ -1591,35 +1641,36 @@ struct TradeTabView: View {
                 Text(displayCoin)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.white)
+                    .lineLimit(1)
             }
-            .frame(width: 55, alignment: .leading)
+            .frame(width: 68, alignment: .leading)
 
             Text(entry.ltv > 0 ? "\(Int(entry.ltv * 100))%" : "N/A")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(entry.ltv > 0 ? .white : .gray)
-                .frame(width: 32, alignment: .trailing)
+                .frame(width: 35, alignment: .trailing)
 
             Text(entry.borrowCapUsed > 0 ? String(format: "%.2f%%", entry.borrowCapUsed * 100) : "-")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.white)
-                .frame(width: 40, alignment: .trailing)
+                .frame(width: 50, alignment: .trailing)
 
             Text(formatPMBalance(entry.netBalance, coin: entry.coin))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(entry.netBalance < 0 ? .tradingRed : .white)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                .frame(width: 80, alignment: .trailing)
                 .lineLimit(1)
 
             Text(formatPMBalance(entry.availableBalance, coin: entry.coin))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.white)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                .frame(width: 80, alignment: .trailing)
                 .lineLimit(1)
 
             Text(formatUSDValue(entry.usdcValue))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(entry.usdcValue < 0 ? .tradingRed : .white)
-                .frame(width: 58, alignment: .trailing)
+                .frame(width: 65, alignment: .trailing)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -1652,6 +1703,27 @@ struct TradeTabView: View {
                 .padding(.vertical, 10)
             }
         }
+    }
+
+    /// Shared "Hide small balances" toggle for both PM and Classic balance views
+    private var hideSmallBalancesToggle: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                hideSmallBalances.toggle()
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: hideSmallBalances ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 13))
+                    .foregroundColor(hideSmallBalances ? .hlGreen : Color(white: 0.4))
+                Text("Hide small balances")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(white: 0.5))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func formatPMBalance(_ v: Double, coin: String) -> String {

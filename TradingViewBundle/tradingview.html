@@ -8,60 +8,13 @@
         html, body { width: 100%; height: 100%; overflow: hidden; background: #0A0A0A; }
         #tv_chart_container { width: 100%; height: 100%; }
 
-        /* Hide the native TradingView toolbar toggle button visually,
-           but keep it in the DOM so programmatic .click() still fires.
-           Uses the stable data-name attribute (not CSS-module classes). */
-        [data-name="toolbar-drawing-toggle-button"] {
-            opacity: 0 !important;
-            pointer-events: none !important;
-            position: absolute !important;
-            width: 1px !important;
-            height: 1px !important;
-            overflow: hidden !important;
-        }
-
-        /* Custom drawing-toolbar toggle button */
-        #tv-toolbar-btn {
-            position: fixed;
-            left: 0;
-            top: 28%;
-            z-index: 50;
-            width: 28px;
-            height: 48px;
-            background: #111;
-            border: none;
-            border-radius: 0 8px 8px 0;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 0;
-            -webkit-tap-highlight-color: transparent;
-            touch-action: manipulation;
-        }
-        #tv-toolbar-btn svg {
-            width: 12px;
-            height: 12px;
-            fill: none;
-            stroke: #1DB954;
-            stroke-width: 2.2;
-            stroke-linecap: round;
-            stroke-linejoin: round;
-            transition: transform 0.15s;
-        }
-        #tv-toolbar-btn.open svg {
-            transform: rotate(180deg);
-        }
+        /* Toolbar toggle: CSS-only tap-target enlargement deferred to
+           a later pass once runtime class names are confirmed. */
     </style>
     <script type="text/javascript" src="charting_library.standalone.js"></script>
 </head>
 <body>
     <div id="tv_chart_container"></div>
-
-    <!-- Custom drawing toolbar toggle (replaces native tiny arrow) -->
-    <button id="tv-toolbar-btn" onclick="toggleDrawingToolbar()">
-        <svg viewBox="0 0 12 12"><polyline points="4,2 8,6 4,10"/></svg>
-    </button>
 
     <script>
     // ═══════════════════════════════════════════════════════════════
@@ -457,26 +410,6 @@
     function setChartType(type) {
         if (tvWidget) {
             tvWidget.activeChart().setChartType(type);
-        }
-    }
-
-    // Toggle the left drawing toolbar.
-    // Strategy: click the REAL native TradingView toggle button via its stable
-    // data-name attribute. The element is visually hidden (opacity:0, off-screen)
-    // but remains in the DOM so .click() fires TradingView's internal handler.
-    var _toolbarOpen = false;
-    function toggleDrawingToolbar() {
-        var nativeToggle = document.querySelector('[data-name="toolbar-drawing-toggle-button"]');
-        if (nativeToggle) {
-            nativeToggle.click();
-            _toolbarOpen = !_toolbarOpen;
-        }
-
-        // Update custom button chevron direction
-        var btn = document.getElementById('tv-toolbar-btn');
-        if (btn) {
-            if (_toolbarOpen) btn.classList.add('open');
-            else btn.classList.remove('open');
         }
     }
 

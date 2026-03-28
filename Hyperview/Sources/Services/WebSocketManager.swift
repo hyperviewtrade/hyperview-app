@@ -29,8 +29,9 @@ final class WebSocketManager: ObservableObject {
     /// Timestamp of last l2Book WebSocket message (used for health-check fallback)
     private(set) var lastL2BookMessageTime: Date = .distantPast
 
-    /// Cached latest allMids prices — updated every ~2s via WebSocket
-    private(set) var latestMidPrices: [String: Double] = [:]
+    /// Cached latest allMids prices — updated every ~2s via WebSocket.
+    /// Also set by WalletManager when fetching allMids directly at startup.
+    var latestMidPrices: [String: Double] = [:]
 
     // Public callbacks
     var onAllMids:    (([String: String]) -> Void)?
@@ -38,6 +39,10 @@ final class WebSocketManager: ObservableObject {
     var onTrades:     (([Trade]) -> Void)?
     var onOrderBook:  ((OrderBook, String) -> Void)?
     var onSpotBalance: (([[String: Any]]) -> Void)?  // spot clearinghouse balances via webData2
+
+    /// The address currently subscribed for webData2 updates.
+    /// Used to discard stale messages after account switches.
+    private(set) var webData2ActiveAddress: String?
 
     // Combine publishers — multiple subscribers can observe without overwriting each other
     let tradePublisher   = PassthroughSubject<[Trade], Never>()
@@ -71,6 +76,7 @@ final class WebSocketManager: ObservableObject {
         task = nil
         isConnected = false
         activeSubs.removeAll()
+        webData2ActiveAddress = nil
     }
 
     // MARK: - Subscriptions
@@ -106,6 +112,7 @@ final class WebSocketManager: ObservableObject {
         let key = "webData2:\(address)"
         guard !activeSubs.contains(key) else { return }
         activeSubs.insert(key)
+        webData2ActiveAddress = address
         print("[WS] Subscribing to webData2 for \(String(address.prefix(10)))...")
         sendDict(method: "subscribe", sub: ["type": "webData2", "user": address], subKey: key)
     }
@@ -113,6 +120,10 @@ final class WebSocketManager: ObservableObject {
     func unsubscribeWebData2(address: String) {
         let key = "webData2:\(address)"
         activeSubs.remove(key)
+        // Clear active address so stale messages arriving after unsub are ignored
+        if webData2ActiveAddress == address {
+            webData2ActiveAddress = nil
+        }
         sendDict(method: "unsubscribe", sub: ["type": "webData2", "user": address])
     }
 
@@ -226,8 +237,19 @@ final class WebSocketManager: ObservableObject {
 
             case "webData2":
                 if let dataDict = msgData as? [String: Any] {
+                    // CRITICAL: Only apply webData2 updates if the data is for the currently active account.
+                    // webData2 messages don't include the address they're for, so we check against
+                    // the tracked subscription address AND the active wallet address.
+                    // This prevents a sub-account's perpValue/positions from contaminating the master account
+                    // (especially after switching away from a sub-account with perp positions).
+                    let activeWalletAddr = WalletManager.shared.connectedWallet?.address
+                    guard let expectedAddr = self.webData2ActiveAddress,
+                          expectedAddr == activeWalletAddr else {
+                        print("[WS] ⚠️ Dropping stale webData2 — expected=\(self.webData2ActiveAddress?.prefix(10) ?? "nil"), active=\(activeWalletAddr?.prefix(10) ?? "nil")")
+                        break
+                    }
+
                     var perpVal: Double?
-                    var spotVal: Double?
                     var withdrawable: Double?
 
                     // 1. Parse perp accountValue + withdrawable + positions
@@ -260,7 +282,7 @@ final class WebSocketManager: ObservableObject {
                                 let funding = (pos["cumFunding"] as? [String: Any])?["sinceOpen"] as? String
                                 let cumulFunding = funding.flatMap(Double.init) ?? 0
                                 return PerpPosition(
-                                    coin: coin, size: szi, entryPrice: entry,
+                                    coin: coin, rawCoin: coin, size: szi, entryPrice: entry,
                                     markPrice: posValue / max(abs(szi), 0.000001),
                                     unrealizedPnl: pnl, leverage: levVal, isCross: isCross,
                                     marginUsed: marginUsed,
@@ -273,43 +295,23 @@ final class WebSocketManager: ObservableObject {
                         }
                     }
 
-                    // 2. Parse spot balances (user holdings with entryNtl)
+                    // 2. Forward spot balances for token-level UI (Trade tab, Send).
+                    // Does NOT update spotValue or accountValue — those come exclusively from REST.
                     if let spotState = dataDict["spotState"] as? [String: Any],
-                       let balances = spotState["balances"] as? [[String: Any]] {
-                        var total: Double = 0
-                        for b in balances {
-                            if let entryNtlStr = b["entryNtl"] as? String,
-                               let entryNtl = Double(entryNtlStr), entryNtl > 0 {
-                                total += entryNtl
-                            }
-                        }
-                        spotVal = total
-                        if !balances.isEmpty {
-                            self.onSpotBalance?(balances)
-                        }
+                       let balances = spotState["balances"] as? [[String: Any]],
+                       !balances.isEmpty {
+                        self.onSpotBalance?(balances)
                     }
 
-                    // 3. Update WalletManager in real-time
-                    if perpVal != nil || spotVal != nil || withdrawable != nil {
-                        let wallet = WalletManager.shared
-                        if let pv = perpVal { wallet.perpValue = pv }
-                        if let sv = spotVal { wallet.spotValue = sv }
-                        if let w = withdrawable { wallet.perpWithdrawable = w }
-                        wallet.accountValue = wallet.perpValue + wallet.spotValue
-                        // Throttle disk writes: only persist every 30s (not every 2s WebSocket tick)
-                        let now = Date()
-                        if now.timeIntervalSince(Self.lastBalancePersist) > 30 {
-                            Self.lastBalancePersist = now
-                            let perpValue = wallet.perpValue
-                            let spotValue = wallet.spotValue
-                            let accountValue = wallet.accountValue
-                            DispatchQueue.global(qos: .utility).async {
-                                UserDefaults.standard.set(perpValue, forKey: "cached_perpValue")
-                                UserDefaults.standard.set(spotValue, forKey: "cached_spotValue")
-                                UserDefaults.standard.set(accountValue, forKey: "cached_accountValue")
-                            }
-                        }
+                    // 3. Update perpValue + withdrawable.
+                    // Keep accountValue coherent for active sub-accounts: refreshAccountStateDirect()
+                    // sets a correct total once, then webData2 can move perpValue afterward.
+                    // For master account we keep REST as total source-of-truth.
+                    if let pv = perpVal {
+                        WalletManager.shared.perpValue = pv
+                        // Do NOT recompute accountValue here — portfolio API is the sole source of truth.
                     }
+                    if let w = withdrawable { WalletManager.shared.perpWithdrawable = w }
                 }
 
             case "candle":
@@ -430,6 +432,11 @@ final class WebSocketManager: ObservableObject {
         case "allMids":
             activeSubs.insert(key)
             send(method: "subscribe", sub: ["type": "allMids"], subKey: key)
+        case "webData2" where parts.count == 2:
+            let addr = parts[1]
+            activeSubs.insert(key)
+            webData2ActiveAddress = addr
+            sendDict(method: "subscribe", sub: ["type": "webData2", "user": addr], subKey: key)
         default:
             break
         }

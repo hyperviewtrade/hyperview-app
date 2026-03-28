@@ -130,6 +130,102 @@ struct TransactionSigner {
         return ["r": r, "s": s, "v": v]
     }
 
+    /// Sign a sendAsset action (transfer spot tokens between master/sub-accounts).
+    /// Works in all account modes including unified/portfolio margin.
+    /// fromSubAccount: source sub-account address, or "" for master.
+    /// destination: target address (master or sub-account).
+    static func signSendAsset(
+        destination: String,
+        token: String,
+        amount: String,
+        fromSubAccount: String
+    ) async throws -> [String: Any] {
+        let (privKey, nonce) = try await authenticate()
+        let action: [String: Any] = [
+            "type": "sendAsset",
+            "hyperliquidChain": "Mainnet",
+            "signatureChainId": "0x66eee",
+            "destination": destination,
+            "sourceDex": "spot",
+            "destinationDex": "spot",
+            "token": token,
+            "amount": amount,
+            "fromSubAccount": fromSubAccount,
+            "nonce": nonce
+        ]
+
+        let sig = try signSendAssetEIP712(
+            destination: destination,
+            token: token,
+            amount: amount,
+            fromSubAccount: fromSubAccount,
+            nonce: UInt64(nonce),
+            privateKey: privKey
+        )
+        return buildPayload(action: action, nonce: nonce, signature: sig)
+    }
+
+    /// EIP-712 signing for sendAsset — user-signed action (same domain as spotSend).
+    private static func signSendAssetEIP712(
+        destination: String,
+        token: String,
+        amount: String,
+        fromSubAccount: String,
+        nonce: UInt64,
+        privateKey: Data
+    ) throws -> [String: Any] {
+        // 1. Domain separator: "HyperliquidSignTransaction", version "1", chainId 421614
+        let domainTypeHash = Keccak256.hash(data: Data(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)".utf8
+        ))
+        var domainData = Data()
+        domainData.append(domainTypeHash)
+        domainData.append(Keccak256.hash(data: Data("HyperliquidSignTransaction".utf8)))
+        domainData.append(Keccak256.hash(data: Data("1".utf8)))
+        domainData.append(padLeft(uint64BE(421614), to: 32))  // 0x66eee
+        domainData.append(Data(repeating: 0, count: 32))       // verifyingContract = address(0)
+        let domainSep = Keccak256.hash(data: domainData)
+
+        // 2. SendAsset type hash
+        let sendAssetTypeHash = Keccak256.hash(data: Data(
+            "HyperliquidTransaction:SendAsset(string hyperliquidChain,string destination,string sourceDex,string destinationDex,string token,string amount,string fromSubAccount,uint64 nonce)".utf8
+        ))
+
+        // 3. Struct hash
+        var structData = Data()
+        structData.append(sendAssetTypeHash)
+        structData.append(Keccak256.hash(data: Data("Mainnet".utf8)))
+        structData.append(Keccak256.hash(data: Data(destination.utf8)))
+        structData.append(Keccak256.hash(data: Data("spot".utf8)))
+        structData.append(Keccak256.hash(data: Data("spot".utf8)))
+        structData.append(Keccak256.hash(data: Data(token.utf8)))
+        structData.append(Keccak256.hash(data: Data(amount.utf8)))
+        structData.append(Keccak256.hash(data: Data(fromSubAccount.utf8)))
+        structData.append(padLeft(uint64BE(nonce), to: 32))
+        let structHash = Keccak256.hash(data: structData)
+
+        // 4. EIP-712 digest
+        var digest = Data([0x19, 0x01])
+        digest.append(domainSep)
+        digest.append(structHash)
+        let finalHash = Keccak256.hash(data: digest)
+
+        #if DEBUG
+        print("[SEND_ASSET] domainSep: \(domainSep.map { String(format: "%02x", $0) }.joined())")
+        print("[SEND_ASSET] typeHash: \(sendAssetTypeHash.map { String(format: "%02x", $0) }.joined())")
+        print("[SEND_ASSET] structHash: \(structHash.map { String(format: "%02x", $0) }.joined())")
+        print("[SEND_ASSET] finalHash: \(finalHash.map { String(format: "%02x", $0) }.joined())")
+        print("[SEND_ASSET] dest=\(destination) token=\(token) amount=\(amount) fromSub=\(fromSubAccount) nonce=\(nonce)")
+        #endif
+
+        // 5. ECDSA sign
+        let sigBytes = try ecdsaSignRecoverable(hash: finalHash, privateKey: privateKey)
+        let r = "0x" + sigBytes[0..<32].map { String(format: "%02x", $0) }.joined()
+        let s = "0x" + sigBytes[32..<64].map { String(format: "%02x", $0) }.joined()
+        let v = Int(sigBytes[64])
+        return ["r": r, "s": s, "v": v]
+    }
+
     /// Sign a usdClassTransfer action (move USDC between perp ↔ spot).
     /// Uses EIP-712 user-signed action (like spotSend), NOT phantom agent.
     /// Domain: "HyperliquidSignTransaction", chainId: 421614 (0x66eee)
@@ -373,6 +469,35 @@ struct TransactionSigner {
             ("subAccountUser", .string(subAccountUser)),
             ("isDeposit", .bool(isDeposit)),
             ("usd", .int(usd))
+        ]
+        let actionValue = MsgPackValue.orderedMap(actionPairs)
+        var data = MsgPackEncoder.encode(actionValue)
+        data.append(uint64BE(UInt64(nonce)))
+        data.append(0x00)
+        let connId = Keccak256.hash(data: data)
+        let sig = try signEIP712WithChainId(connectionId: connId, privateKey: privKey, chainId: 1337)
+        return buildPayload(action: action, nonce: nonce, signature: sig)
+    }
+
+    /// Sign a subAccountSpotTransfer action (transfer spot tokens between master and sub-account).
+    /// isDeposit: true = master→sub, false = sub→master.
+    /// token: spot token name (e.g. "HYPE", "PURR").
+    /// amount: string amount (e.g. "1.5").
+    static func signSubAccountSpotTransfer(subAccountUser: String, isDeposit: Bool, token: String, amount: String) async throws -> [String: Any] {
+        let (privKey, nonce) = try await authenticate()
+        let action: [String: Any] = [
+            "type": "subAccountSpotTransfer",
+            "subAccountUser": subAccountUser,
+            "isDeposit": isDeposit,
+            "token": token,
+            "amount": amount
+        ]
+        let actionPairs: [(String, MsgPackValue)] = [
+            ("type", .string("subAccountSpotTransfer")),
+            ("subAccountUser", .string(subAccountUser)),
+            ("isDeposit", .bool(isDeposit)),
+            ("token", .string(token)),
+            ("amount", .string(amount))
         ]
         let actionValue = MsgPackValue.orderedMap(actionPairs)
         var data = MsgPackEncoder.encode(actionValue)

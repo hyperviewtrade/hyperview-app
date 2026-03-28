@@ -74,6 +74,7 @@ final class WalletManager: ObservableObject {
     @Published var perpWithdrawable: Double = 0  // Available margin for perp trading
     @Published var spotTokenBalances: [String: Double] = [:]  // Per-token spot holdings (coin → total amount)
     @Published var spotTokenAvailable: [String: Double] = [:]  // Per-token AVAILABLE spot (total - hold)
+    @Published var spotTokenEntryNtl: [String: Double] = [:]   // Per-token entry notional (USD cost basis)
     @Published var activePositions: [PerpPosition] = []       // Live perp positions (main + HIP-3)
     @Published var isPortfolioMargin: Bool = false              // Account abstraction mode
     @Published var activeVaultAddress: String? = nil            // Sub-account address (nil = master)
@@ -83,6 +84,35 @@ final class WalletManager: ObservableObject {
     @Published var dailyPnl: Double = 0
     @Published var evmHypeBalance: Double = 0  // HYPE on HyperEVM (needs transfer to Core)
     @Published var stakingTier: StakingTier = .none
+
+    /// True while a balance fetch is in-flight after an account switch.
+    @Published var isBalanceLoading: Bool = false
+    /// The address that the current accountValue belongs to.
+    var accountValueAddress: String?
+
+    /// Cached sub-account API response for instant display in Settings.
+    /// Key: master address, Value: raw JSON array from subAccounts API.
+    private(set) var cachedSubAccountsJSON: [[String: Any]] = []
+    /// The master wallet address (the address saved to UserDefaults, never changes on sub-account switch).
+    /// Use this to always get the real master address even when connectedWallet is a sub-account.
+    var savedMasterAddress: String? {
+        guard let data = UserDefaults.standard.data(forKey: walletKey),
+              let wallet = try? JSONDecoder().decode(ConnectedWallet.self, from: data)
+        else { return nil }
+        return wallet.address
+    }
+    private var cachedSubAccountsMaster: String?
+    private var portfolioMarginByAddress: [String: Bool] = [:]
+
+    func getCachedSubAccounts(for master: String) -> [[String: Any]]? {
+        guard master == cachedSubAccountsMaster, !cachedSubAccountsJSON.isEmpty else { return nil }
+        return cachedSubAccountsJSON
+    }
+
+    func cacheSubAccounts(_ data: [[String: Any]], for master: String) {
+        cachedSubAccountsJSON = data
+        cachedSubAccountsMaster = master
+    }
 
     // Biometric (Face ID / Touch ID) for transaction signing & app lock
     @Published var biometricEnabled: Bool {
@@ -673,6 +703,8 @@ final class WalletManager: ObservableObject {
         connectedWallet = nil
         UserDefaults.standard.removeObject(forKey: walletKey)
         accountValue = 0
+        accountValueAddress = nil
+        isBalanceLoading = false
         perpValue    = 0
         spotValue    = 0
         dailyPnl     = 0
@@ -680,6 +712,7 @@ final class WalletManager: ObservableObject {
         perpWithdrawable = 0
         spotTokenBalances = [:]
         spotTokenAvailable = [:]
+        spotTokenEntryNtl = [:]
         activePositions = []
         mainDexPositions = []
         hip3Positions = []
@@ -781,7 +814,7 @@ final class WalletManager: ObservableObject {
                 let funding = (pos["cumFunding"] as? [String: Any])?["sinceOpen"] as? String
                 let cumulFunding = funding.flatMap(Double.init) ?? 0
                 return PerpPosition(
-                    coin: coin, size: szi, entryPrice: entry,
+                    coin: coin, rawCoin: coin, size: szi, entryPrice: entry,
                     markPrice: posValue / max(abs(szi), 0.000001),
                     unrealizedPnl: pnl, leverage: levVal, isCross: isCross,
                     marginUsed: marginUsed,
@@ -901,6 +934,7 @@ final class WalletManager: ObservableObject {
                 positions.append(
                     PerpPosition(
                         coin: coin,
+                        rawCoin: coin,
                         size: szi,
                         entryPrice: entryPx,
                         markPrice: posValue / max(abs(szi), 0.000001),
@@ -947,6 +981,7 @@ final class WalletManager: ObservableObject {
                     positions.append(
                         PerpPosition(
                             coin: coin,
+                            rawCoin: coin,
                             size: szi,
                             entryPrice: entry,
                             markPrice: posValue / max(abs(szi), 0.000001),
@@ -1095,27 +1130,37 @@ final class WalletManager: ObservableObject {
 
     func switchToAddress(_ address: String) {
         let wallet = ConnectedWallet(address: address, walletApp: "Local", connectedAt: Date())
-        // Unsubscribe old, clear data, switch, resubscribe
+        // Unsubscribe old, clear data, switch
         if let oldAddr = connectedWallet?.address {
             WebSocketManager.shared.unsubscribeWebData2(address: oldAddr)
         }
+        // Mark balance as loading — HomeView will show a placeholder until the new
+        // fetch completes, preventing both flicker-to-$0 and stale cross-account values.
+        isBalanceLoading = true
+        // Clear position/token state (belongs to the old account).
         mainDexPositions = []
         hip3Positions = []
         activePositions = []
-        // Reset WebSocket subscription flag so it re-subscribes to new address
+        dailyPnl = 0
+        perpWithdrawable = 0
+        spotTokenBalances = [:]
+        spotTokenAvailable = [:]
+        spotTokenEntryNtl = [:]
+        // Reset so subscribeToSpotBalanceWS re-subscribes for the new address
         webData2Subscribed = false
         connectedWallet = wallet
+        isPortfolioMargin = cachedIsPortfolioMargin(for: address) ?? false
         // Don't persist to UserDefaults — sub-account switch is temporary
-        WebSocketManager.shared.subscribeWebData2(address: address)
+        // WebSocket subscription happens inside refreshAccountState → subscribeToSpotBalanceWS
         Task {
             await refreshAccountState()
-            await fetchAbstractionMode(for: address)
         }
     }
 
     /// Fetch and set the abstraction mode (Classic/Portfolio Margin) for a given address.
-    func fetchAbstractionMode(for address: String) async {
-        guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return }
+    @discardableResult
+    func fetchAbstractionMode(for address: String) async -> Bool? {
+        guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1124,11 +1169,43 @@ final class WalletManager: ObservableObject {
             "user": address
         ])
         guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let str = try? JSONSerialization.jsonObject(with: data) as? String else { return }
-        await MainActor.run {
-            isPortfolioMargin = (str == "portfolioMargin")
-            print("[ABSTRACTION] \(address.prefix(10))... = \(str) → PM=\(isPortfolioMargin)")
+              let str = try? JSONSerialization.jsonObject(with: data) as? String else { return nil }
+
+        let pm = (str == "portfolioMargin")
+        portfolioMarginByAddress[address.lowercased()] = pm
+
+        if connectedWallet?.address.lowercased() == address.lowercased() {
+            isPortfolioMargin = pm
+            // Do NOT recompute accountValue — portfolio API is the sole source of truth.
         }
+
+        print("[ABSTRACTION] \(address.prefix(10))... = \(str) → PM=\(pm)")
+        return pm
+    }
+
+    func cachedIsPortfolioMargin(for address: String) -> Bool? {
+        portfolioMarginByAddress[address.lowercased()]
+    }
+
+    // totalAccountValue / recomputeAccountValueForActiveAccount REMOVED.
+    // accountValue is set exclusively from the portfolio API (accountValueHistory.last).
+    // This eliminates all PM/non-PM formula inconsistencies.
+
+    /// Prefetch sub-accounts and cache the raw JSON so Settings can display them instantly.
+    func prefetchSubAccounts(for address: String) async {
+        guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "type": "subAccounts",
+            "user": address
+        ])
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return }
+        cacheSubAccounts(arr, for: address)
+        print("[SUB-ACCOUNTS] Prefetched \(arr.count) sub-accounts for \(address.prefix(10))…")
     }
 
     // MARK: - Import private key (TEMPORARY — for testing only)
@@ -1243,25 +1320,25 @@ final class WalletManager: ObservableObject {
     private var webData2Subscribed = false
     private var spotRefreshTimer: Timer?
 
-    /// Start a periodic spot balance refresh every 30s.
-    /// Skips REST fetch when WebSocket is connected (webData2 provides real-time spot data).
+    /// Periodic REST refresh of spot balance + total equity every 30s.
+    /// REST is the sole source of truth for spotValue and accountValue.
     private func startSpotRefreshTimer() {
         guard spotRefreshTimer == nil else { return }
         spotRefreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, let addr = self.connectedWallet?.address else { return }
-                // Skip redundant REST fetch when WS is delivering real-time spot updates
-                if WebSocketManager.shared.isConnected { return }
-                let spotURL = URL(string: "\(Self.backendBaseURL)/spot-balance/\(addr)")!
+                let capturedAddr = addr
+                let spotURL = URL(string: "\(Self.backendBaseURL)/spot-balance/\(capturedAddr)")!
                 if let (data, _) = try? await URLSession.shared.data(from: spotURL),
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let balances = json["balances"] as? [[String: Any]] {
                     let val = await self.computeSpotValue(balances: balances)
+                    // Only apply if still the active account
+                    guard self.connectedWallet?.address == capturedAddr else { return }
                     if val != self.spotValue {
                         self.spotValue = val
-                        self.accountValue = self.perpValue + self.spotValue
+                        // Do NOT recompute accountValue — portfolio API is the sole source of truth.
                         UserDefaults.standard.set(self.spotValue, forKey: "cached_spotValue")
-                        UserDefaults.standard.set(self.accountValue, forKey: "cached_accountValue")
                     }
                 }
             }
@@ -1284,12 +1361,10 @@ final class WalletManager: ObservableObject {
         ws.onSpotBalance = { [weak self] balances in
             guard let self else { return }
             Task { @MainActor in
-                let spotVal = await self.computeSpotValue(balances: balances)
-                // Always update — including when spot drops to 0 (withdrawal/transfer)
-                self.spotValue = spotVal
-                self.accountValue = self.perpValue + self.spotValue
-                UserDefaults.standard.set(self.spotValue, forKey: "cached_spotValue")
-                UserDefaults.standard.set(self.accountValue, forKey: "cached_accountValue")
+                // Update token-level balances only (for Trade tab, Send asset UI).
+                // Does NOT update spotValue or accountValue — those come from REST only,
+                // to prevent partial WebSocket updates from overwriting the correct total.
+                self.updateSpotTokenBalances(from: balances)
             }
         }
     }
@@ -1297,34 +1372,66 @@ final class WalletManager: ObservableObject {
     func refreshAccountState() async {
         guard let address = connectedWallet?.address else { return }
 
-        // Subscribe to webData2 for real-time spot updates (one-time)
+        // Capture the address we are refreshing for.
+        // After every async suspension, verify it is still the active account.
+        // If the user switched accounts while we were loading, discard the stale result
+        // to prevent a sub-account's values from polluting the master's display.
+        let refreshAddress = address
+
+        // Subscribe to webData2 for real-time position updates (one-time)
         subscribeToSpotBalanceWS()
+
+        // Fetch abstraction mode from userAbstraction (used by total-equity formula).
+        async let abstractionTask: Bool? = fetchAbstractionMode(for: refreshAddress)
 
         // For sub-accounts, fetch directly from HL API (backend may not have them)
         if activeVaultAddress != nil {
-            await refreshAccountStateDirect()
-            // For PM, marginSummary.accountValue already includes spot
-            if isPortfolioMargin {
-                accountValue = perpValue
-            } else {
-                accountValue = perpValue + spotValue
+            // Fetch positions/spot AND portfolio API in parallel for speed.
+            // Portfolio API is the source of truth for accountValue (same as WalletView).
+            async let directTask: () = refreshAccountStateDirect()
+            async let portfolioTask: [[String: Any]] = {
+                (try? await HyperliquidAPI.shared.fetchPortfolio(address: refreshAddress)) ?? []
+            }()
+
+            await directTask
+            let portfolioData = await portfolioTask
+            _ = await abstractionTask
+
+            guard connectedWallet?.address == refreshAddress else {
+                print("[BALANCE] ⚠️ Account changed during refresh, discarding stale sub-account result")
+                return
             }
+
+            // Use portfolio API accountValueHistory as the single source of truth
+            // — this is the exact same value WalletView/PortfolioChartView displays.
+            var gotPortfolioValue = false
+            for entry in portfolioData {
+                guard let period = entry["period"] as? String, period == "day" else { continue }
+                if let avh = entry["accountValueHistory"] as? [Any],
+                   let lastPair = avh.last as? [Any],
+                   lastPair.count >= 2 {
+                    if let d = lastPair[1] as? Double { accountValue = d; accountValueAddress = refreshAddress; gotPortfolioValue = true }
+                    else if let s = lastPair[1] as? String, let d = Double(s) { accountValue = d; accountValueAddress = refreshAddress; gotPortfolioValue = true }
+                }
+                if let pnlHistory = entry["pnlHistory"] as? [Any],
+                   let lastPair = pnlHistory.last as? [Any],
+                   lastPair.count >= 2 {
+                    if let d = lastPair[1] as? Double { dailyPnl = d }
+                    else if let s = lastPair[1] as? String, let d = Double(s) { dailyPnl = d }
+                }
+                break
+            }
+
+            // If portfolio API returned no data, keep previous accountValue — do NOT recompute from formula.
+            if !gotPortfolioValue {
+                print("[BALANCE] ⚠️ Portfolio API empty for \(refreshAddress.prefix(10))…, keeping previous value")
+            }
+
+            isBalanceLoading = false
+            print("[BALANCE] sub-account \(refreshAddress.prefix(10))… accountValue=\(accountValue) (portfolio=\(gotPortfolioValue))")
             UserDefaults.standard.set(perpValue, forKey: "cached_perpValue")
             UserDefaults.standard.set(spotValue, forKey: "cached_spotValue")
             UserDefaults.standard.set(accountValue, forKey: "cached_accountValue")
-            // Fetch 24h PnL
-            do {
-                let portfolioData = try await HyperliquidAPI.shared.fetchPortfolio(address: address)
-                for entry in portfolioData {
-                    guard let period = entry["period"] as? String, period == "day" else { continue }
-                    if let pnlHistory = entry["pnlHistory"] as? [Any],
-                       let lastPair = pnlHistory.last as? [Any],
-                       lastPair.count >= 2 {
-                        if let d = lastPair[1] as? Double { dailyPnl = d }
-                        else if let s = lastPair[1] as? String, let d = Double(s) { dailyPnl = d }
-                    }
-                }
-            } catch {}
             return
         }
 
@@ -1335,6 +1442,13 @@ req.timeoutInterval = 15
 
 do {
     let (data, _) = try await URLSession.shared.data(for: req)
+
+    // After network await: verify this is still the active account
+    guard connectedWallet?.address == refreshAddress else {
+        print("[BALANCE] ⚠️ Account changed during backend fetch, discarding stale result for \(refreshAddress.prefix(10))…")
+        return
+    }
+
     guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
 
     // Parse perp account value
@@ -1343,8 +1457,6 @@ do {
        let valStr = marginSummary["accountValue"] as? String,
        let val = Double(valStr) {
         perpValue = val
-
-                // Daily PnL will be fetched from portfolio API below
             }
 
             // Parse spot value using allMids for pricing
@@ -1353,32 +1465,41 @@ do {
                let balances = spot["balances"] as? [[String: Any]],
                !balances.isEmpty {
                 let spotVal = await computeSpotValue(balances: balances)
-                print("[BALANCE-BACKEND] spot=\(spotVal) from backend")
-                if spotVal > 0 || spotValue == 0 {
-                    spotValue = spotVal
-                    gotSpot = true
+                // Re-check after async computeSpotValue
+                guard connectedWallet?.address == refreshAddress else {
+                    print("[BALANCE] ⚠️ Account changed during spot compute, discarding")
+                    return
                 }
+                print("[BALANCE-BACKEND] spot=\(spotVal) from backend")
+                spotValue = spotVal
+                gotSpot = true
             }
 
             // If spot empty, schedule a delayed retry via /spot-balance (after startup rush)
             if !gotSpot && spotValue == 0 {
+                let delayAddr = refreshAddress
                 print("[BALANCE] Spot empty, scheduling delayed /spot-balance in 3s...")
                 Task { [weak self] in
                     try? await Task.sleep(nanoseconds: 3_000_000_000)
-                    guard let self, let addr = self.connectedWallet?.address else { return }
-                    let spotURL = URL(string: "\(Self.backendBaseURL)/spot-balance/\(addr)")!
+                    guard let self else { return }
+                    // Only apply if this is still the active account
+                    guard self.connectedWallet?.address == delayAddr else {
+                        print("[BALANCE-DELAYED] ⚠️ Account changed, discarding delayed result for \(delayAddr.prefix(10))…")
+                        return
+                    }
+                    let spotURL = URL(string: "\(Self.backendBaseURL)/spot-balance/\(delayAddr)")!
                     if let (data, _) = try? await URLSession.shared.data(from: spotURL),
                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                        let balances = json["balances"] as? [[String: Any]],
                        !balances.isEmpty {
                         let val = await self.computeSpotValue(balances: balances)
+                        guard self.connectedWallet?.address == delayAddr else { return }
                         if val > 0 {
                             await MainActor.run {
                                 self.spotValue = val
-                                self.accountValue = self.perpValue + self.spotValue
+                                // Do NOT recompute accountValue — portfolio API is the sole source of truth.
                                 UserDefaults.standard.set(self.spotValue, forKey: "cached_spotValue")
-                                UserDefaults.standard.set(self.accountValue, forKey: "cached_accountValue")
-                                print("[BALANCE-DELAYED] spot=\(val) total=\(self.accountValue)")
+                                print("[BALANCE-DELAYED] spot=\(val)")
                             }
                         }
                     }
@@ -1395,39 +1516,49 @@ do {
 
         } catch {
             print("[BALANCE] Backend failed: \(error.localizedDescription), falling back to direct API")
-            // Fallback: direct HL API calls (may rate-limit but better than nothing)
+            guard connectedWallet?.address == refreshAddress else { return }
             await refreshAccountStateDirect()
         }
 
-        // Recompute total from perp + spot
-        // For PM wallets, marginSummary.accountValue already includes spot collateral
-        // Don't double-count by adding spotValue
-        if isPortfolioMargin {
-            accountValue = perpValue
-            print("[BALANCE] PM mode: accountValue=\(perpValue) (marginSummary includes spot)")
-        } else {
-            accountValue = perpValue + spotValue
+        // Final guard: only write total if still the active account
+        guard connectedWallet?.address == refreshAddress else {
+            print("[BALANCE] ⚠️ Account changed before final write, discarding")
+            return
         }
+        _ = await abstractionTask
 
-        // Fetch portfolio API for 24h PnL
+        // Portfolio API is the SOLE source of truth for accountValue (same as WalletView).
+        // Also extract dailyPnl from the same response.
         do {
             let portfolioData = try await HyperliquidAPI.shared.fetchPortfolio(address: address)
+            guard connectedWallet?.address == refreshAddress else {
+                print("[BALANCE] ⚠️ Account changed during portfolio fetch, discarding")
+                return
+            }
             for entry in portfolioData {
                 guard let period = entry["period"] as? String, period == "day" else { continue }
+                // Account value from portfolio history
+                if let avh = entry["accountValueHistory"] as? [Any],
+                   let lastPair = avh.last as? [Any],
+                   lastPair.count >= 2 {
+                    if let d = lastPair[1] as? Double { accountValue = d; accountValueAddress = refreshAddress }
+                    else if let s = lastPair[1] as? String, let d = Double(s) { accountValue = d; accountValueAddress = refreshAddress }
+                }
+                // Daily PnL
                 if let pnlHistory = entry["pnlHistory"] as? [Any],
                    let lastPair = pnlHistory.last as? [Any],
                    lastPair.count >= 2 {
-                    let pnl: Double
-                    if let d = lastPair[1] as? Double { pnl = d }
-                    else if let s = lastPair[1] as? String, let d = Double(s) { pnl = d }
-                    else { continue }
-                    dailyPnl = pnl
-                    print("[PNL-24H] dailyPnl=\(pnl)")
+                    if let d = lastPair[1] as? Double { dailyPnl = d }
+                    else if let s = lastPair[1] as? String, let d = Double(s) { dailyPnl = d }
                 }
+                break
             }
         } catch {
-            print("[BALANCE-PORTFOLIO] Failed: \(error.localizedDescription)")
+            // Portfolio API failed — keep previous accountValue, do NOT recompute from formula.
+            print("[BALANCE] ⚠️ Portfolio API failed: \(error.localizedDescription), keeping previous value")
         }
+        isBalanceLoading = false
+        print("[BALANCE] accountValue=\(accountValue) perpValue=\(perpValue) spotValue=\(spotValue)")
 
         // Persist — always save, including zero balances (so stale cache gets cleared)
         UserDefaults.standard.set(perpValue, forKey: "cached_perpValue")
@@ -1449,46 +1580,95 @@ do {
         }
     }
 
-    /// Compute spot holdings USD value from balance array.
-    /// Uses entryNtl (USD value from API) first, then WebSocket prices as fallback.
-    private func computeSpotValue(balances: [[String: Any]]) async -> Double {
-        let midPrices = WebSocketManager.shared.latestMidPrices
+    /// Update per-token spot balances from WebSocket data (for Trade tab, Send asset UI).
+    /// Merges into existing state. Does NOT update spotValue or accountValue.
+    private func updateSpotTokenBalances(from balances: [[String: Any]]) {
+        for b in balances {
+            guard let coin = b["coin"] as? String else { continue }
+            let amount: Double
+            if let s = b["total"] as? String, let d = Double(s) { amount = d }
+            else if let d = b["total"] as? Double { amount = d }
+            else if let n = b["total"] as? NSNumber { amount = n.doubleValue }
+            else { continue }
 
-        var total: Double = 0
+            if abs(amount) > 0.0000001 {
+                spotTokenBalances[coin] = amount
+                let hold: Double
+                if let s = b["hold"] as? String, let d = Double(s) { hold = d }
+                else if let d = b["hold"] as? Double { hold = d }
+                else if let n = b["hold"] as? NSNumber { hold = n.doubleValue }
+                else { hold = 0 }
+                spotTokenAvailable[coin] = max(0, amount - hold)
+                if let s = b["entryNtl"] as? String, let d = Double(s) { spotTokenEntryNtl[coin] = d }
+                else if let d = b["entryNtl"] as? Double { spotTokenEntryNtl[coin] = d }
+                else if let n = b["entryNtl"] as? NSNumber { spotTokenEntryNtl[coin] = n.doubleValue }
+            } else {
+                spotTokenBalances.removeValue(forKey: coin)
+                spotTokenAvailable.removeValue(forKey: coin)
+                spotTokenEntryNtl.removeValue(forKey: coin)
+            }
+        }
+    }
+
+    /// Compute spot holdings USD value from REST balance array.
+    /// Uses allMids for current market prices. Called ONLY from REST paths.
+    /// Also populates spotTokenBalances/spotTokenAvailable/spotTokenEntryNtl.
+    private func computeSpotValue(balances: [[String: Any]]) async -> Double {
+        var midPrices = WebSocketManager.shared.latestMidPrices
+
+        // At startup, WebSocket allMids hasn't arrived yet — fetch directly.
+        if midPrices.isEmpty {
+            let apiURL = URL(string: "https://api.hyperliquid.xyz/info")!
+            let body: [String: Any] = ["type": "allMids"]
+            if let data = try? await HyperliquidAPI.shared.post(url: apiURL, body: body),
+               let mids = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+                var fetched: [String: Double] = [:]
+                for (coin, priceStr) in mids {
+                    if let p = Double(priceStr) { fetched[coin] = p }
+                }
+                midPrices = fetched
+                WebSocketManager.shared.latestMidPrices = fetched
+            }
+        }
+
         var tokenBals: [String: Double] = [:]
         var tokenAvail: [String: Double] = [:]
+        var tokenEntry: [String: Double] = [:]
+        let stables: Set<String> = ["USDC", "USDH", "USDT", "USDT0", "USDE"]
+
+        // Parse balances (REST sends "total" as String)
         for b in balances {
             guard let coin = b["coin"] as? String,
                   let totStr = b["total"] as? String,
-                  let amount = Double(totStr), amount > 0
+                  let amount = Double(totStr),
+                  abs(amount) > 0.0000001
             else { continue }
 
             tokenBals[coin] = amount
-            // Available = total - hold (hold = locked by open orders)
             let hold = Double(b["hold"] as? String ?? "0") ?? 0
             tokenAvail[coin] = max(0, amount - hold)
-
-            // Stablecoins = face value
-            if coin == "USDC" || coin == "USDH" || coin == "USDT" || coin == "USDT0" || coin == "USDE" {
-                total += amount
-                continue
-            }
-
-            // 1. Use entryNtl if available (USD value directly from API, no price lookup needed)
             if let entryNtlStr = b["entryNtl"] as? String,
-               let entryNtl = Double(entryNtlStr), entryNtl > 0 {
-                total += entryNtl
-                continue
-            }
-
-            // 2. Fallback: WebSocket mid prices
-            let priceCoin = Self.spotToPerpName[coin] ?? coin
-            if let price = midPrices[priceCoin], price > 0 {
-                total += amount * price
+               let entryNtl = Double(entryNtlStr) {
+                tokenEntry[coin] = entryNtl
             }
         }
+
+        // Compute total from all tokens
+        var total: Double = 0
+        for (coin, amount) in tokenBals {
+            if stables.contains(coin) {
+                total += amount
+            } else {
+                let priceCoin = Self.spotToPerpName[coin] ?? coin
+                if let price = midPrices[priceCoin], price > 0 {
+                    total += amount * price
+                }
+            }
+        }
+        print("[SPOT-REST] TOTAL=$\(total) tokens=\(tokenBals.count)")
         spotTokenBalances = tokenBals
         spotTokenAvailable = tokenAvail
+        spotTokenEntryNtl = tokenEntry
         return total
     }
 
@@ -1533,13 +1713,14 @@ do {
                 if let p = Double(priceStr) { midPrices[coin] = p }
             }
 
+            let stables: Set<String> = ["USDC", "USDH", "USDT", "USDT0", "USDE"]
             var total: Double = 0
             for b in balances {
                 guard let coin = b["coin"] as? String,
                       let totStr = b["total"] as? String,
-                      let amount = Double(totStr), amount > 0
+                      let amount = Double(totStr), abs(amount) > 0.0000001
                 else { continue }
-                if coin == "USDC" || coin == "USDH" || coin == "USDT" {
+                if stables.contains(coin) {
                     total += amount
                 } else {
                     let priceCoin = Self.spotToPerpName[coin] ?? coin
@@ -1558,14 +1739,30 @@ do {
     /// Fallback: direct API calls (used when backend is down)
     private func refreshAccountStateDirect() async {
         guard let address = connectedWallet?.address else { return }
-        if let state = try? await HyperliquidAPI.shared.fetchUserState(address: address),
+        let capturedAddr = address
+
+        // Fetch perp state and spot value IN PARALLEL for faster display
+        async let perpTask: [String: Any]? = try? HyperliquidAPI.shared.fetchUserState(address: capturedAddr)
+        async let spotTask: Double = fetchSpotValue(address: capturedAddr)
+
+        let perpState = await perpTask
+        let spotVal = await spotTask
+
+        // Guard: discard if account changed during fetch
+        guard connectedWallet?.address == capturedAddr else {
+            print("[BALANCE] ⚠️ Account changed during refreshAccountStateDirect, discarding stale result")
+            return
+        }
+
+        if let state = perpState,
            let ms = state["marginSummary"] as? [String: Any],
            let valStr = ms["accountValue"] as? String,
            let val = Double(valStr) {
             perpValue = val
         }
-        let spotVal = await fetchSpotValue(address: address)
-        if spotVal > 0 || spotValue == 0 { spotValue = spotVal }
+        // Always set spotValue — even if 0 — to prevent stale values from previous account
+        spotValue = spotVal
+        print("[BALANCE-DIRECT] addr=\(capturedAddr.prefix(10))… perp=\(perpValue) spot=\(spotValue)")
     }
 
     /// Fetch HYPE balance on HyperEVM and convert to USD value.
@@ -1621,17 +1818,19 @@ do {
               let balances = spotJson["balances"] as? [[String: Any]]
         else { return 0 }
 
+        let stables: Set<String> = ["USDC", "USDH", "USDT", "USDT0", "USDE"]
         var total: Double = 0
         for b in balances {
             guard let coin = b["coin"] as? String,
                   let totStr = b["total"] as? String,
-                  let amount = Double(totStr), amount > 0
+                  let amount = Double(totStr), abs(amount) > 0.0000001
             else { continue }
 
-            if coin == "USDC" || coin == "USDH" || coin == "USDT" {
+            if stables.contains(coin) {
+                // Stablecoins = face value (positive for holdings, negative for borrows)
                 total += amount
             } else {
-                // Map wrapped spot name (USOL) → perp name (SOL) for price lookup
+                // Non-stablecoins: use current market price
                 let priceCoin = Self.spotToPerpName[coin] ?? coin
                 if let price = midPrices[priceCoin], price > 0 {
                     total += amount * price
@@ -1655,15 +1854,16 @@ do {
         webData2Subscribed = false
 
         connectedWallet = wallet
-        isPortfolioMargin = false // Reset immediately — will be updated by fetchAbstractionMode
+        isPortfolioMargin = cachedIsPortfolioMargin(for: wallet.address) ?? false
         if let data = try? JSONEncoder().encode(wallet) {
             UserDefaults.standard.set(data, forKey: walletKey)
         }
-        // Subscribe WebSocket to new address
-        WebSocketManager.shared.subscribeWebData2(address: wallet.address)
+        // WebSocket subscription happens inside refreshAccountState → subscribeToSpotBalanceWS
+        // Do NOT subscribe here to avoid double-subscription or orphaned subs.
         Task {
             await refreshAccountState()
-            await fetchAbstractionMode(for: wallet.address)
+            // Prefetch sub-accounts in background so Settings opens instantly
+            await prefetchSubAccounts(for: wallet.address)
         }
         // Register with backend analytics
         registerAnalytics(address: wallet.address)
@@ -1674,10 +1874,13 @@ do {
               let wallet = try? JSONDecoder().decode(ConnectedWallet.self, from: data)
         else { return }
         connectedWallet = wallet
-        // Refresh balances on app launch
+        // Cached accountValue from UserDefaults belongs to this saved wallet
+        accountValueAddress = wallet.address
+        // Refresh balances on app launch (fetchAbstractionMode is called inside)
         Task {
             await refreshAccountState()
-            await fetchAbstractionMode(for: wallet.address)
+            // Prefetch sub-accounts in background so Settings opens instantly
+            await prefetchSubAccounts(for: wallet.address)
         }
         // Heartbeat on app launch
         registerAnalytics(address: wallet.address)

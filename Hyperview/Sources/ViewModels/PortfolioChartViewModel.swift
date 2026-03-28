@@ -181,17 +181,9 @@ final class PortfolioChartViewModel: ObservableObject {
             hasFetched = true
             applySelection()
 
-            // Sync latest account value to WalletManager (single source of truth for Home)
-            if let latestAV = cache["allTime"]?.acctValue.last?.value, latestAV > 0 {
-                let wm = WalletManager.shared
-                if wm.accountValue != latestAV {
-                    wm.accountValue = latestAV
-                    wm.spotValue = latestAV - wm.perpValue
-                    UserDefaults.standard.set(wm.accountValue, forKey: "cached_accountValue")
-                    UserDefaults.standard.set(wm.spotValue, forKey: "cached_spotValue")
-                    print("[PORTFOLIO] Synced accountValue=\(latestAV) to WalletManager")
-                }
-            }
+            // Note: accountValue is owned by WalletManager REST refresh only.
+            // PortfolioChartViewModel must NOT write to WalletManager.shared.accountValue
+            // as that would overwrite the authoritative REST-sourced balance.
         } catch is CancellationError {
             // Swipe cancelled — ignore silently
         } catch let urlError as URLError where urlError.code == .cancelled {

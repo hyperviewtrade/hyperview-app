@@ -31,7 +31,7 @@ struct SettingsView: View {
 
     // Sub-accounts
     @State private var subAccounts: [SubAccountInfo] = []
-    @State private var isLoadingSubAccounts = false
+    @State private var isLoadingSubAccounts = true  // Start true — assume loading until proven empty
     @State private var showCreateSubAccount = false
     @State private var newSubAccountName = ""
     @State private var createSubError: String?
@@ -512,11 +512,15 @@ struct SettingsView: View {
         }
         .task {
             if masterAddress == nil {
-                masterAddress = walletMgr.connectedWallet?.address
+                // Always use the saved master address (not the current connectedWallet which
+                // may be a sub-account). This ensures subAccounts API is called with the master.
+                masterAddress = walletMgr.savedMasterAddress ?? walletMgr.connectedWallet?.address
             }
-            await loadGlobalAliases()
-            await loadStakingInfo()
-            await loadSubAccounts()
+            // Load sub-accounts in parallel with other data — don't wait for aliases/staking
+            async let subTask: () = loadSubAccounts()
+            async let aliasTask: () = loadGlobalAliases()
+            async let stakingTask: () = loadStakingInfo()
+            _ = await (subTask, aliasTask, stakingTask)
         }
         .onChange(of: phantomAddress) { _, _ in
             Task { await loadStakingInfo() }
@@ -527,8 +531,22 @@ struct SettingsView: View {
 
     private func loadSubAccounts() async {
         guard let wallet = walletMgr.connectedWallet else { return }
-        let address = masterAddress ?? wallet.address
-        await MainActor.run { isLoadingSubAccounts = true }
+        let address = masterAddress ?? walletMgr.savedMasterAddress ?? wallet.address
+        print("[SETTINGS] loadSubAccounts using master=\(address.prefix(10))… (wallet=\(wallet.address.prefix(10))…, masterAddress=\(masterAddress?.prefix(10) ?? "nil"))")
+
+        // Step 1: Show cached data instantly if available
+        if let cached = walletMgr.getCachedSubAccounts(for: address), subAccounts.isEmpty {
+            let quick = parseSubAccountsQuick(cached)
+            if !quick.isEmpty {
+                await MainActor.run {
+                    subAccounts = quick
+                    if masterAddress == nil { masterAddress = walletMgr.savedMasterAddress ?? wallet.address }
+                }
+            }
+        }
+
+        // Step 2: Fetch fresh data in background
+        await MainActor.run { isLoadingSubAccounts = subAccounts.isEmpty }
 
         guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return }
         var request = URLRequest(url: url)
@@ -546,77 +564,123 @@ struct SettingsView: View {
             return
         }
 
-        // Fetch oracle prices for PM balance calculation
-        var oraclePrices: [String: Double] = ["USDC": 1.0, "USDH": 1.0, "USDT0": 1.0, "USDE": 1.0]
-        if let midsReq = try? JSONSerialization.data(withJSONObject: ["type": "allMids"]) {
-            var mReq = URLRequest(url: URL(string: "https://api.hyperliquid.xyz/info")!)
-            mReq.httpMethod = "POST"
-            mReq.addValue("application/json", forHTTPHeaderField: "Content-Type")
-            mReq.httpBody = midsReq
-            if let (mData, _) = try? await URLSession.shared.data(for: mReq),
-               let mids = try? JSONSerialization.jsonObject(with: mData) as? [String: String] {
-                for (coin, priceStr) in mids {
-                    if let p = Double(priceStr) { oraclePrices[coin] = p }
-                }
-                if let btcP = oraclePrices["BTC"] { oraclePrices["UBTC"] = btcP }
-            }
-        }
+        // Cache the raw response for next time
+        walletMgr.cacheSubAccounts(arr, for: address)
 
-        var parsed: [SubAccountInfo] = []
+        // Collect sub-account addresses + names
+        var subInfos: [(name: String, address: String, isPM: Bool)] = []
         for item in arr {
             guard let name = item["name"] as? String,
                   let subAddr = item["subAccountUser"] as? String
             else { continue }
             let isPM = (item["spotState"] as? [String: Any])?["portfolioMarginEnabled"] as? Bool ?? false
+            subInfos.append((name: name, address: subAddr, isPM: isPM))
+        }
 
-            var balance: Double
-            if isPM {
-                // PM accounts: fetch spotClearinghouseState for real supplied/borrowed
-                balance = 0
-                if let body = try? JSONSerialization.data(withJSONObject: [
-                    "type": "spotClearinghouseState", "user": subAddr
-                ]) {
-                    var sReq = URLRequest(url: URL(string: "https://api.hyperliquid.xyz/info")!)
-                    sReq.httpMethod = "POST"
-                    sReq.addValue("application/json", forHTTPHeaderField: "Content-Type")
-                    sReq.httpBody = body
-                    if let (sData, _) = try? await URLSession.shared.data(for: sReq),
-                       let sJson = try? JSONSerialization.jsonObject(with: sData) as? [String: Any],
-                       let balances = sJson["balances"] as? [[String: Any]] {
-                        for bal in balances {
-                            let coin = bal["coin"] as? String ?? ""
-                            let total = Double(bal["total"] as? String ?? "0") ?? 0
-                            let isStable = coin == "USDC" || coin == "USDH" || coin == "USDT0" || coin == "USDE"
-                            let price = oraclePrices[coin] ?? (isStable ? 1.0 : 0)
-                            balance += total * price
-                        }
-                    }
+        // Fetch portfolio API for each sub-account — the SAME source WalletView uses.
+        // This is the only reliable way to get the correct Account Value for all account types.
+        var portfolioValues: [String: Double] = [:]  // address → accountValue
+        await withTaskGroup(of: (String, Double?).self) { group in
+            for info in subInfos {
+                group.addTask {
+                    let val = await Self.fetchPortfolioAccountValue(address: info.address)
+                    return (info.address, val)
                 }
-            } else {
-                // Classic accounts: use perp accountValue
-                let acctVal = (item["clearinghouseState"] as? [String: Any])?["marginSummary"] as? [String: Any]
-                balance = (acctVal?["accountValue"] as? String).flatMap(Double.init) ?? 0
             }
+            for await (addr, val) in group {
+                if let v = val { portfolioValues[addr.lowercased()] = v }
+            }
+        }
+
+        var parsed: [SubAccountInfo] = []
+        for info in subInfos {
+            let balance = portfolioValues[info.address.lowercased()] ?? 0
+            print("[SETTINGS] Sub '\(info.name)' addr=\(info.address.prefix(10))… balance=\(balance) (from portfolio API)")
 
             parsed.append(SubAccountInfo(
-                name: name,
-                address: subAddr,
+                name: info.name,
+                address: info.address,
                 balance: String(format: "$%.2f", balance),
-                isPortfolioMargin: isPM
+                isPortfolioMargin: info.isPM
             ))
         }
 
+        print("[SETTINGS] loadSubAccounts complete: \(parsed.count) subs via portfolio API")
         await MainActor.run {
             subAccounts = parsed
-            if masterAddress == nil { masterAddress = wallet.address }
+            if masterAddress == nil { masterAddress = walletMgr.savedMasterAddress ?? wallet.address }
             isLoadingSubAccounts = false
         }
+    }
+
+    /// Quick parse of cached sub-account JSON — shows names and addresses instantly,
+    /// with "Loading…" as placeholder balance. The full loadSubAccounts fetches the
+    /// portfolio API (same source as WalletView) to fill in the correct values.
+    private func parseSubAccountsQuick(_ arr: [[String: Any]]) -> [SubAccountInfo] {
+        var result: [SubAccountInfo] = []
+        for item in arr {
+            guard let name = item["name"] as? String,
+                  let subAddr = item["subAccountUser"] as? String
+            else { continue }
+
+            let isPM = walletMgr.cachedIsPortfolioMargin(for: subAddr)
+                ?? ((item["spotState"] as? [String: Any])?["portfolioMarginEnabled"] as? Bool ?? false)
+            result.append(SubAccountInfo(
+                name: name,
+                address: subAddr,
+                balance: "Loading…",
+                isPortfolioMargin: isPM
+            ))
+        }
+        return result
+    }
+
+    /// Fetch Account Value from portfolio API — the exact same source WalletView/PortfolioChartView uses.
+    /// Returns the last data point of accountValueHistory for the "day" period.
+    private static func fetchPortfolioAccountValue(address: String) async -> Double? {
+        guard let data = try? await HyperliquidAPI.shared.fetchPortfolio(address: address) else { return nil }
+        for entry in data {
+            guard let period = entry["period"] as? String, period == "day" else { continue }
+            if let avh = entry["accountValueHistory"] as? [Any],
+               let lastPair = avh.last as? [Any],
+               lastPair.count >= 2 {
+                if let d = lastPair[1] as? Double { return d }
+                if let s = lastPair[1] as? String, let d = Double(s) { return d }
+            }
+        }
+        return nil
+    }
+
+    private func resolvePortfolioMarginModes(from arr: [[String: Any]]) async -> [String: Bool] {
+        var result: [String: Bool] = [:]
+        for item in arr {
+            guard let subAddr = item["subAccountUser"] as? String else { continue }
+            let key = subAddr.lowercased()
+
+            if let cached = walletMgr.cachedIsPortfolioMargin(for: subAddr) {
+                result[key] = cached
+                continue
+            }
+
+            if let fetched = await walletMgr.fetchAbstractionMode(for: subAddr) {
+                result[key] = fetched
+                continue
+            }
+
+            // Fallback only if userAbstraction is unavailable.
+            let fallback = (item["spotState"] as? [String: Any])?["portfolioMarginEnabled"] as? Bool ?? false
+            result[key] = fallback
+            print("[SETTINGS] ⚠️ userAbstraction unavailable for \(subAddr.prefix(10))… fallback PM=\(fallback)")
+        }
+        return result
     }
 
     private func switchToAccount(address: String, name: String, isPM: Bool) {
         let isMaster = (address == masterAddress)
         activeSubAccount = isMaster ? nil : address
-        walletMgr.isPortfolioMargin = isPM
+        // Don't pre-set isPortfolioMargin here — refreshAccountState (via fetchAbstractionMode)
+        // will detect the correct mode from the userAbstraction API.
+        // portfolioMarginEnabled from spotClearinghouseState is about lending/earn, NOT trading mode.
         walletMgr.activeVaultAddress = isMaster ? nil : address
         walletMgr.switchToAddress(address)
     }
