@@ -8,22 +8,60 @@
         html, body { width: 100%; height: 100%; overflow: hidden; background: #0A0A0A; }
         #tv_chart_container { width: 100%; height: 100%; }
 
-        /* Enlarge the native TradingView left toolbar toggle for easier mobile tapping */
-        .layout__area--left [class*="arrow"],
-        .layout__area--left [class*="toggle"],
-        [data-name="drawing-toolbar"] [class*="arrow"],
-        [data-name="drawing-toolbar"] [class*="toggle"] {
-            min-width: 28px !important;
-            min-height: 44px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
+        /* Hide the native TradingView toolbar toggle button visually,
+           but keep it in the DOM so programmatic .click() still fires.
+           Uses the stable data-name attribute (not CSS-module classes). */
+        [data-name="toolbar-drawing-toggle-button"] {
+            opacity: 0 !important;
+            pointer-events: none !important;
+            position: absolute !important;
+            width: 1px !important;
+            height: 1px !important;
+            overflow: hidden !important;
+        }
+
+        /* Custom drawing-toolbar toggle button */
+        #tv-toolbar-btn {
+            position: fixed;
+            left: 0;
+            top: 28%;
+            z-index: 50;
+            width: 28px;
+            height: 48px;
+            background: #111;
+            border: none;
+            border-radius: 0 8px 8px 0;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+        }
+        #tv-toolbar-btn svg {
+            width: 12px;
+            height: 12px;
+            fill: none;
+            stroke: #1DB954;
+            stroke-width: 2.2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+            transition: transform 0.15s;
+        }
+        #tv-toolbar-btn.open svg {
+            transform: rotate(180deg);
         }
     </style>
     <script type="text/javascript" src="charting_library.standalone.js"></script>
 </head>
 <body>
     <div id="tv_chart_container"></div>
+
+    <!-- Custom drawing toolbar toggle (replaces native tiny arrow) -->
+    <button id="tv-toolbar-btn" onclick="toggleDrawingToolbar()">
+        <svg viewBox="0 0 12 12"><polyline points="4,2 8,6 4,10"/></svg>
+    </button>
 
     <script>
     // ═══════════════════════════════════════════════════════════════
@@ -278,8 +316,9 @@
                 'volume_force_overlay',
                 'symbol_search_hot_key',
                 'border_around_the_chart',
-                // Additional: reduce init overhead for faster first paint
-                'create_volume_indicator_by_default',  // defer volume to after first paint
+                // NOTE: create_volume_indicator_by_default is intentionally NOT disabled.
+                // TradingView must create the volume pane during init so the layout is
+                // stable before we reveal the chart (avoids visible vertical reflow).
                 'header_undo_redo',                    // rarely used on mobile
                 'display_market_status',               // not needed for 24/7 crypto
                 'timeframes_toolbar',                  // bottom bar, already empty
@@ -296,35 +335,31 @@
         });
 
         tvWidget.onChartReady(function() {
-            // Notify Swift IMMEDIATELY — hides skeleton for fastest perceived load.
+            // Volume study was created by TradingView during widget init
+            // (create_volume_indicator_by_default is NOT disabled).
+            // Compact the volume pane to our desired height BEFORE revealing
+            // the chart, so the layout is stable on first visible frame.
+            try {
+                var chart = tvWidget.activeChart();
+                compactVolumePaneHeight(chart);
+            } catch(e) {}
+
+            // Now notify Swift — skeleton hides, chart is already in final layout.
             window.webkit.messageHandlers.tradingview.postMessage(
                 JSON.stringify({ type: 'chartReady' })
             );
-
-            // Defer volume study to next event loop tick — after first paint.
-            setTimeout(function() {
-                try {
-                    var chart = tvWidget.activeChart();
-                    var studies = chart.getAllStudies();
-                    var hasVolume = studies.some(function(s) { return s.name === 'Volume'; });
-                    if (!hasVolume) {
-                        chart.createStudy('Volume', false, false, {}, null, {
-                            'volume.volume.color.0': '#E54D42',
-                            'volume.volume.color.1': '#1DB954',
-                            'volume.volume.transparency': 70,
-                        });
-                    }
-                    // Force volume pane to minimal height
-                    var allPanes = chart.getPanes();
-                    if (allPanes && allPanes.length > 1) {
-                        // Volume is typically the second pane — set its height ratio small
-                        try {
-                            allPanes[allPanes.length - 1].setHeight(60);
-                        } catch(e2) {}
-                    }
-                } catch(e) {}
-            }, 0);
         });
+    }
+
+    // Shrink the volume pane to a thin strip.  Called from the createStudy
+    // callback AND after symbol changes so the height is always enforced.
+    function compactVolumePaneHeight(chart) {
+        try {
+            var panes = chart.getPanes();
+            if (panes && panes.length > 1) {
+                panes[panes.length - 1].setHeight(55);
+            }
+        } catch(e) {}
     }
 
     // Called from Swift to change symbol
@@ -340,9 +375,14 @@
         }
 
         if (tvWidget) {
-            tvWidget.activeChart().setSymbol(actualSymbol, function() {});
+            var chart = tvWidget.activeChart();
+            chart.setSymbol(actualSymbol, function() {
+                // Re-enforce compact volume after symbol switch
+                // (TradingView may reset pane heights on setSymbol)
+                setTimeout(function() { compactVolumePaneHeight(chart); }, 100);
+            });
             if (interval) {
-                tvWidget.activeChart().setResolution(interval, function() {});
+                chart.setResolution(interval, function() {});
             }
         }
     }
@@ -417,6 +457,26 @@
     function setChartType(type) {
         if (tvWidget) {
             tvWidget.activeChart().setChartType(type);
+        }
+    }
+
+    // Toggle the left drawing toolbar.
+    // Strategy: click the REAL native TradingView toggle button via its stable
+    // data-name attribute. The element is visually hidden (opacity:0, off-screen)
+    // but remains in the DOM so .click() fires TradingView's internal handler.
+    var _toolbarOpen = false;
+    function toggleDrawingToolbar() {
+        var nativeToggle = document.querySelector('[data-name="toolbar-drawing-toggle-button"]');
+        if (nativeToggle) {
+            nativeToggle.click();
+            _toolbarOpen = !_toolbarOpen;
+        }
+
+        // Update custom button chevron direction
+        var btn = document.getElementById('tv-toolbar-btn');
+        if (btn) {
+            if (_toolbarOpen) btn.classList.add('open');
+            else btn.classList.remove('open');
         }
     }
 

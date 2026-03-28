@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct HomeRelativePerformanceCard: View {
-    @ObservedObject private var vm = RelativePerformanceViewModel.shared
+    @StateObject private var vm = RelativePerformanceViewModel.shared
 
     private let timeframes = RelativePerformanceViewModel.Timeframe.allCases
 

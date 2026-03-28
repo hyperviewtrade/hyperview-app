@@ -54,8 +54,10 @@ struct ChartContainerView: View {
                 .environmentObject(marketsVM)
         }
         .task {
-            print("[CHART-TIMING] CHART SCREEN OPEN")
-            if chartVM.candles.isEmpty && !chartVM.isCustomTVChart {
+            // Skip if openChart() already initiated a load — prevents duplicate
+            // API call + flash on first open (the two loadChart calls would race
+            // and the second arrival causes a visible chart blink).
+            if chartVM.candles.isEmpty && !chartVM.isCustomTVChart && !chartVM.isLoadInFlight {
                 await chartVM.loadChart(
                     symbol: chartVM.selectedSymbol,
                     interval: chartVM.selectedInterval

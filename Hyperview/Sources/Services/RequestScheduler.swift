@@ -75,13 +75,26 @@ final class RequestScheduler {
         }
     }
 
+    private var rateLimitLogCount = 0
+    private var lastRateLimitLogTime: Date = .distantPast
+
     /// Report a 429 rate limit response
     func reportRateLimit() {
         isRateLimited = true
         backoffMultiplier = min(backoffMultiplier * 2, 16)
         let delay = backoffMultiplier * 1.0 + Double.random(in: 0...0.5)
         rateLimitResetTime = Date().addingTimeInterval(delay)
-        print("[Scheduler] Rate limited. Backing off for \(String(format: "%.1f", delay))s")
+
+        // Deduplicate: only log once per 10 seconds
+        let now = Date()
+        rateLimitLogCount += 1
+        if now.timeIntervalSince(lastRateLimitLogTime) >= 10 {
+            let suppressed = rateLimitLogCount - 1
+            let extra = suppressed > 0 ? " (+\(suppressed) suppressed)" : ""
+            print("[Scheduler] Rate limited. Backing off \(String(format: "%.1f", delay))s (x\(String(format: "%.0f", backoffMultiplier)))\(extra)")
+            lastRateLimitLogTime = now
+            rateLimitLogCount = 0
+        }
     }
 
     /// Reset backoff after successful request

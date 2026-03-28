@@ -400,6 +400,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Hyperview/Info.plist;
 				INFOPLIST_KEY_NSFaceIDUsageDescription = "Hyperview uses Face ID to secure your transactions and protect your private key.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Hyperview needs access to save PNL and LARP cards to your photo library.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -436,6 +437,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Hyperview/Info.plist;
 				INFOPLIST_KEY_NSFaceIDUsageDescription = "Hyperview uses Face ID to secure your transactions and protect your private key.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Hyperview needs access to save PNL and LARP cards to your photo library.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

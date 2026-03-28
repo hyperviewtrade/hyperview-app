@@ -316,15 +316,8 @@ final class WebSocketManager: ObservableObject {
                 if let candleDict = msgData as? [String: Any],
                    let candleData = try? JSONSerialization.data(withJSONObject: candleDict),
                    let candle = try? JSONDecoder().decode(Candle.self, from: candleData) {
-                    #if DEBUG
-                    print("🕯 WS candle → s=\(candle.s) i=\(candle.i) c=\(candle.c)")
-                    #endif
                     self.onCandle?(candle)
                     self.candlePublisher.send(candle)
-                } else {
-                    #if DEBUG
-                    print("⚠️ WS candle → failed to decode: \(String(describing: msgData))")
-                    #endif
                 }
 
             case "trades":

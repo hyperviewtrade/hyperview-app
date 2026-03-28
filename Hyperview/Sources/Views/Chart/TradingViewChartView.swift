@@ -103,6 +103,7 @@ struct TradingViewChartView: UIViewRepresentable {
             coord.lastRefreshTrigger = trigger
             coord.refreshChart()
         }
+
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -119,6 +120,15 @@ struct TradingViewChartView: UIViewRepresentable {
         private var candleSub: AnyCancellable?
         private var livePriceSub: AnyCancellable?
         private var previousLivePrice: Double = 0
+
+        // MARK: - JS Bridge Coalescer
+        // Batches realtime bar + live price line into a single evaluateJavaScript call
+        // per timer tick, halving JS bridge crossings during fast markets.
+        private var coalescerTimer: Timer?
+        private let coalescerInterval: TimeInterval = 0.1   // 10 Hz max
+        private var pendingBarJSON: String?                   // latest bar JSON
+        private var pendingLivePrice: (price: Double, isUp: Bool)?
+        private var lastPushedBarClose: Double = 0
 
         // Track current WS subscription
         private var subscribedSymbol: String?
@@ -537,6 +547,20 @@ struct TradingViewChartView: UIViewRepresentable {
         private func handleGetBarsHL(symbol: String, interval: String,
                                      from: Double, to: Double, countBack: Int,
                                      firstDataRequest: Bool, requestId: Int) {
+            // Before chartReady, TradingView pre-loads history with sequential
+            // getBars calls (firstDataRequest=false). Each is a fresh API call
+            // (~5s) that blocks onChartReady. Return noData immediately for these
+            // pre-init history requests so onChartReady fires after just the first
+            // fast fetch. Users can still scroll back after chart is visible.
+            if !firstDataRequest && !isChartReady {
+                if coldStartT0 > 0 {
+                    let ms = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - coldStartT0) * 1000)
+                    print("[CHART-TIMING] getBars SKIP pre-init history (+\(ms)ms from create)")
+                }
+                resolveJSRequest(requestId, data: ["bars": [] as [[String: Any]], "noData": true])
+                return
+            }
+
             Task { @MainActor in
                 do {
                     let hlInterval = ChartInterval(rawValue: interval) ?? .oneHour
@@ -550,7 +574,7 @@ struct TradingViewChartView: UIViewRepresentable {
                         // NEVER duplicates a request.
                         candles = try await getCandles(symbol: symbol, interval: hlInterval)
                     } else {
-                        // Scrolling back in history — always fresh range fetch
+                        // Scrolling back in history — fetch on demand (chart is already visible)
                         candles = try await HyperliquidAPI.shared.fetchCandlesRange(
                             coin: symbol, interval: hlInterval,
                             startMs: startMs, endMs: endMs
@@ -1517,6 +1541,8 @@ struct TradingViewChartView: UIViewRepresentable {
             candleSub = nil
             externalPollTimer?.invalidate()
             externalPollTimer = nil
+            stopCoalescer()
+            pendingBarJSON = nil
             if let sym = subscribedSymbol, let intv = subscribedInterval {
                 let hlInterval = ChartInterval(rawValue: intv) ?? .oneHour
                 WebSocketManager.shared.unsubscribeCandles(coin: sym, interval: hlInterval)
@@ -1544,15 +1570,59 @@ struct TradingViewChartView: UIViewRepresentable {
         private func pushRealtimeBar(_ bar: [String: Any]) {
             guard let jsonData = try? JSONSerialization.data(withJSONObject: bar),
                   let jsonStr = String(data: jsonData, encoding: .utf8) else { return }
-            let js = "onRealtimeBar(\(jsonStr));"
-            DispatchQueue.main.async { self.webView?.evaluateJavaScript(js) }
+            // Store close for live-price dedup
+            if let closeVal = bar["close"] as? Double { lastPushedBarClose = closeVal }
+            // Buffer — the coalescer flushes at 10 Hz
+            pendingBarJSON = jsonStr
+            ensureCoalescerRunning()
+        }
+
+        // MARK: Coalescer lifecycle
+
+        private func ensureCoalescerRunning() {
+            guard coalescerTimer == nil else { return }
+            coalescerTimer = Timer.scheduledTimer(withTimeInterval: coalescerInterval,
+                                                  repeats: true) { [weak self] _ in
+                self?.flushCoalescer()
+            }
+        }
+
+        private func flushCoalescer() {
+            guard let webView else { return }
+            var parts: [String] = []
+
+            if let barJSON = pendingBarJSON {
+                pendingBarJSON = nil
+                parts.append("onRealtimeBar(\(barJSON))")
+            }
+            if let lp = pendingLivePrice {
+                pendingLivePrice = nil
+                parts.append("updateLivePrice(\(lp.price), \(lp.isUp))")
+            }
+
+            if parts.isEmpty {
+                // Nothing pending — stop the timer to save CPU
+                stopCoalescer()
+                return
+            }
+            let js = parts.joined(separator: "; ") + ";"
+            webView.evaluateJavaScript(js)
+        }
+
+        private func stopCoalescer() {
+            coalescerTimer?.invalidate()
+            coalescerTimer = nil
         }
 
         // MARK: - Public API
 
         func changeSymbol(_ symbol: String, interval: ChartInterval, isCustom: Bool = false) {
-            // Reset price line for new symbol
+            // Reset price line and coalescer for new symbol
             previousLivePrice = 0
+            stopCoalescer()
+            pendingBarJSON = nil
+            pendingLivePrice = nil
+            lastPushedBarClose = 0
             // NOTE: Do NOT reset isChartReady here. TradingView's chartReady callback
             // fires only once on initial widget creation (initChart). changeSymbol()
             // switches the symbol internally without re-emitting chartReady.
@@ -1570,6 +1640,7 @@ struct TradingViewChartView: UIViewRepresentable {
         func refreshChart() {
             webView?.evaluateJavaScript("refreshData();")
         }
+
 
         func changeResolution(_ interval: ChartInterval) {
             let tvInterval = Self.hlIntervalToTV(interval)
@@ -1603,8 +1674,9 @@ struct TradingViewChartView: UIViewRepresentable {
                     guard let self, self.isChartReady, price > 0 else { return }
                     let isUp = price >= self.previousLivePrice && self.previousLivePrice > 0
                     self.previousLivePrice = price
-                    let js = "updateLivePrice(\(price), \(isUp));"
-                    self.webView?.evaluateJavaScript(js)
+                    // Buffer — the coalescer batches this with any pending bar update
+                    self.pendingLivePrice = (price: price, isUp: isUp)
+                    self.ensureCoalescerRunning()
                 }
         }
 
@@ -1612,6 +1684,8 @@ struct TradingViewChartView: UIViewRepresentable {
             livePriceSub?.cancel()
             livePriceSub = nil
             previousLivePrice = 0
+            // Clear any buffered price so it doesn't flush for the old symbol
+            pendingLivePrice = nil
             webView?.evaluateJavaScript("removeLivePriceLine();")
         }
 

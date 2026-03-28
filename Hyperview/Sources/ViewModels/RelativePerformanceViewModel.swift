@@ -127,11 +127,18 @@ final class RelativePerformanceViewModel: ObservableObject {
             }
         }
 
-        // Only update if we got data (never downgrade to empty)
+        // Merge: for coins missing in fresh data (fetch timeout), keep cached version.
+        // This prevents rows from vanishing when individual candle requests fail.
         if !result.isEmpty {
-            unsortedRows = result
+            let freshSymbols = Set(result.map(\.symbol))
+            let retained = unsortedRows.filter { !freshSymbols.contains($0.symbol) }
+            let merged = result + retained
+            unsortedRows = merged
             applySorting()
-            saveToCache(result)
+            // Only persist if we have complete data (avoid caching degraded state)
+            if freshSymbols.count >= Self.comparisonCoins.count {
+                saveToCache(merged)
+            }
         }
     }
 

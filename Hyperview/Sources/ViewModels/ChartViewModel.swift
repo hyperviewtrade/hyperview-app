@@ -25,6 +25,11 @@ final class ChartViewModel: ObservableObject {
     /// Incremented to signal the TradingView WebView to re-fetch data
     @Published var refreshTrigger:       Int        = 0
 
+
+    /// True while a loadChart() call is in-flight. Prevents the ChartContainerView
+    /// .task from launching a duplicate load when openChart() already initiated one.
+    var isLoadInFlight = false
+
     // Chart display type
     @Published var chartType:             ChartType  = .candles
 
@@ -144,6 +149,7 @@ final class ChartViewModel: ObservableObject {
     func loadChart(symbol: String, interval: ChartInterval,
                    displayName: String? = nil, perpEquivalent: String? = nil) async {
 
+        isLoadInFlight = true
         // Debounce rapid market switches: cancel pending load if user switches again within 150ms.
         // Skip debounce on first open (candles empty) — no previous state to protect, saves 150ms.
         pendingLoadSymbol = symbol
@@ -190,7 +196,6 @@ final class ChartViewModel: ObservableObject {
             fetched.sort { $0.t < $1.t }
             candles   = fetched
             livePrice = candles.last?.close ?? 0
-            print("✅ REST candles: \(candles.count) for \(symbol)/\(interval.rawValue) | first.t=\(candles.first?.t ?? 0) last.t=\(candles.last?.t ?? 0)")
             subscribeCandles()
         } catch let apiErr as APIError {
             switch apiErr {
@@ -206,6 +211,7 @@ final class ChartViewModel: ObservableObject {
         }
 
         isLoading = false
+        isLoadInFlight = false
 
         // Signal TradingView chart to re-fetch bars from the bridge.
         // Only needed for explicit reload (same symbol) — when the symbol changed,
@@ -342,9 +348,11 @@ final class ChartViewModel: ObservableObject {
         let rawCoin = selectedSymbol
         let rawInterval = selectedInterval.rawValue
 
+        // NOTE: WS candle subscription is NOT done here.
+        // TradingView's JS calls subscribeBars → Coordinator.handleSubscribeBars()
+        // which subscribes via WebSocketManager.subscribeCandles.
+        // Subscribing here too would cause a duplicate subscription.
         ws.connect()
-        ws.subscribeCandles(coin: rawCoin, interval: selectedInterval)
-        print("📡 Subscribed WS candles: \(rawCoin)/\(rawInterval)")
 
         // Live price: subscribe to allMids ticker (updates every ~1 s)
         // Uses the Combine publisher so MarketsViewModel's onAllMids callback isn't overwritten
@@ -399,7 +407,6 @@ final class ChartViewModel: ObservableObject {
         let candle = validateCandle(rawCandle)
         guard let last = candles.last else {
             candles.append(candle)
-            print("🕯 upsert: first candle appended t=\(candle.t) | total=1")
             return
         }
 
@@ -422,15 +429,12 @@ final class ChartViewModel: ObservableObject {
                                  v: candle.v,
                                  n: candle.n)
             candles[candles.count - 1] = merged
-            print("🕯 upsert: merged last | c=\(candle.c) h=\(merged.h) l=\(merged.l) | total=\(candles.count)")
         } else if candle.t > last.t {
             // New period started → append
             candles.append(candle)
             if candles.count > 1000 { candles.removeFirst(candles.count - 1000) }
-            print("🕯 upsert: NEW candle appended t=\(candle.t) c=\(candle.c) | total=\(candles.count)")
         } else {
             // Stale or out-of-order → ignore
-            print("🕯 upsert: IGNORED stale candle t=\(candle.t) last.t=\(last.t)")
         }
     }
 

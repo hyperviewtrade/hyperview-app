@@ -471,7 +471,6 @@ final class HyperliquidAPI {
     // The display cap (depth selector 10/20/50) is applied inside OrderBookView.aggregate()
     // AFTER aggregation, so large tick sizes always have enough raw levels to fill the view.
     func fetchOrderBook(coin: String, nSigFigs: Int = 5) async throws -> OrderBook {
-        print("📦 SNAPSHOT REQUEST START (nSigFigs=\(nSigFigs))")
         // Pass full coin name with dex prefix (e.g. "xyz:SP500") — same as candles
         var body: [String: Any] = ["type": "l2Book", "coin": coin]
         if nSigFigs != 5 { body["nSigFigs"] = nSigFigs }
@@ -484,10 +483,6 @@ final class HyperliquidAPI {
               let rawLevels = json["levels"] as? [Any],
               rawLevels.count >= 2
         else { throw APIError.parseError("l2Book") }
-
-        // Step 1 — log raw counts before any decoding to verify API depth.
-        print("📦 SNAPSHOT raw bids:", (rawLevels[0] as? [Any])?.count ?? 0)
-        print("📦 SNAPSHOT raw asks:", (rawLevels[1] as? [Any])?.count ?? 0)
 
         // Step 2 — parse each side, handling both response formats.
         func parseSide(_ raw: Any) -> [OrderBookLevel] {
@@ -518,8 +513,6 @@ final class HyperliquidAPI {
         let asks = parseSide(rawLevels[1])
 
         let book = OrderBook(coin: coin, bids: bids, asks: asks)
-        print("REST SNAPSHOT bids:", book.bids.count)
-        print("REST SNAPSHOT asks:", book.asks.count)
         return book
     }
 

@@ -60,7 +60,9 @@ struct ConnectedWallet: Codable {
 final class WalletManager: ObservableObject {
     static let shared = WalletManager()
 
-    @Published private(set) var connectedWallet: ConnectedWallet?
+    @Published private(set) var connectedWallet: ConnectedWallet? {
+        didSet { _isLocalWalletCached = nil }   // invalidate cache on wallet change
+    }
     @Published private(set) var isConnecting = false
     @Published var errorMessage: String?
 
@@ -99,13 +101,24 @@ final class WalletManager: ObservableObject {
 
     /// True if this is a wallet we generated in-app (has private key in Keychain)
     /// AND the key actually matches the connected wallet address.
+    ///
+    /// Cached to avoid per-render Keychain I/O + secp256k1 + Keccak256.
+    /// Invalidated automatically when `connectedWallet` changes (via didSet).
+    private var _isLocalWalletCached: Bool?
     var isLocalWallet: Bool {
+        if let cached = _isLocalWalletCached { return cached }
+        let result = computeIsLocalWallet()
+        _isLocalWalletCached = result
+        return result
+    }
+
+    private func computeIsLocalWallet() -> Bool {
         guard connectedWallet?.walletApp == "Local",
               let keyData = loadPrivateKey() else { return false }
-        // Verify key matches connected address
         guard let derivedAddress = Self.deriveAddress(from: keyData) else { return false }
         let matches = derivedAddress.lowercased() == connectedWallet?.address.lowercased()
         if !matches {
+            // Log once per wallet change, not per render
             print("⚠️ isLocalWallet: key address \(derivedAddress) ≠ wallet address \(connectedWallet?.address ?? "nil")")
         }
         return matches
@@ -1249,7 +1262,6 @@ final class WalletManager: ObservableObject {
                         self.accountValue = self.perpValue + self.spotValue
                         UserDefaults.standard.set(self.spotValue, forKey: "cached_spotValue")
                         UserDefaults.standard.set(self.accountValue, forKey: "cached_accountValue")
-                        print("[SPOT-TIMER] Updated spot=\(val) total=\(self.accountValue)")
                     }
                 }
             }
@@ -1278,7 +1290,6 @@ final class WalletManager: ObservableObject {
                 self.accountValue = self.perpValue + self.spotValue
                 UserDefaults.standard.set(self.spotValue, forKey: "cached_spotValue")
                 UserDefaults.standard.set(self.accountValue, forKey: "cached_accountValue")
-                print("[WS-SPOT] Updated spot=\(spotVal) total=\(self.accountValue)")
             }
         }
     }
@@ -1467,7 +1478,6 @@ do {
             if let entryNtlStr = b["entryNtl"] as? String,
                let entryNtl = Double(entryNtlStr), entryNtl > 0 {
                 total += entryNtl
-                print("[SPOT] \(coin): entryNtl=$\(entryNtl)")
                 continue
             }
 
@@ -1475,9 +1485,6 @@ do {
             let priceCoin = Self.spotToPerpName[coin] ?? coin
             if let price = midPrices[priceCoin], price > 0 {
                 total += amount * price
-                print("[SPOT] \(coin)→\(priceCoin): \(amount) × $\(price) = $\(amount * price)")
-            } else {
-                print("[SPOT] \(coin): no price found")
             }
         }
         spotTokenBalances = tokenBals
@@ -1628,9 +1635,6 @@ do {
                 let priceCoin = Self.spotToPerpName[coin] ?? coin
                 if let price = midPrices[priceCoin], price > 0 {
                     total += amount * price
-                    print("[SPOT] \(coin)→\(priceCoin): \(amount) × $\(price) = $\(amount * price)")
-                } else {
-                    print("[SPOT] \(coin)→\(priceCoin): NO PRICE FOUND (mids count: \(midPrices.count))")
                 }
             }
         }

@@ -72,23 +72,29 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 
     // MARK: - Notification Handling
 
-    /// Called when user taps a notification -> navigate to Liquidations section.
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                            didReceive response: UNNotificationResponse) async {
+    /// Called when user taps a notification → navigate to Liquidations section.
+    ///
+    /// Uses the completion-handler delegate variant (NOT the async variant) because:
+    /// 1. The system keeps the callback alive until completionHandler() is called,
+    ///    so DispatchQueue.main.async is safe — it won't be discarded.
+    /// 2. DispatchQueue.main.async defers @Published mutations to the next run-loop
+    ///    tick, avoiding Swift exclusivity violations if SwiftUI is mid-render.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
         let userInfo = response.notification.request.content.userInfo
         let notifType = userInfo["type"] as? String
+        let walletAddress = userInfo["walletAddress"] as? String
 
-        await MainActor.run {
+        DispatchQueue.main.async {
             if notifType == "liquidation" {
-                // Navigate to Home tab → Liquidations section
                 AppState.shared.selectedTab = 0
                 AppState.shared.pendingLiquidationOpen = true
-                print("[LIQ NOTIFICATION TAP] type=liquidation, navigating to Liquidations")
-            } else if let address = userInfo["walletAddress"] as? String {
-                // Fallback: open wallet detail
+            } else if let address = walletAddress {
                 AppState.shared.selectedTab = 0
                 AppState.shared.pendingWalletAddress = address
             }
+            completionHandler()
         }
     }
 

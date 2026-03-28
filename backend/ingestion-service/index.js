@@ -36,8 +36,9 @@ const LIQ_POLL_MS         = 15_000;       // 15 s
 const WHALE_THRESHOLD_USD = 100_000;      // $100 k
 const WS_STALE_MS         = 12_000;       // force reconnect if no allMids in 12 s
 const MAX_WHALE_LIST      = 200;          // keep last 200 whale events in Redis
-const MAX_HIP3_CONCURRENT = 30;           // max parallel HL calls for hip3
+const MAX_HIP3_CONCURRENT = 5;            // max parallel HL calls for hip3 (reduced from 10)
 const HIP3_CACHE_TTL      = 30;           // seconds
+const HIP3_STAGGER_MS     = 200;          // delay between each HIP-3 batch task start
 
 const MONITORED_COINS = [
   'BTC', 'ETH', 'SOL', 'HYPE', 'XRP', 'BNB',
@@ -106,11 +107,98 @@ function iso() { return new Date().toISOString().slice(11, 23); }
 function log(tag, msg) { console.log(`[${iso()}][${tag}] ${msg}`); }
 
 // ─────────────────────────────────────────────────────────────
+// Global Rate Limit State — shared across all HL calls
+// ─────────────────────────────────────────────────────────────
+
+const globalRL = {
+  /** Timestamp (ms) until which all HL calls should pause */
+  cooldownUntil: 0,
+  /** Current backoff multiplier — grows on 429, shrinks slowly on success */
+  backoffMultiplier: 1,
+  /** Count of 429s in the current window (for summary logging) */
+  windowHitCount: 0,
+  /** Start of the current logging window */
+  windowStart: Date.now(),
+  /** Minimum interval between summary log lines (ms) */
+  logWindowMs: 60_000,
+  /** Consecutive 429s without any success (drives hard pause) */
+  consecutiveHits: 0,
+  /** Timestamp of last summary log */
+  lastSummaryLogTime: 0,
+  /** Count of successful calls since last 429 (drives ramp-up) */
+  successesSinceLastHit: 0,
+};
+
+/** Register a 429 — sets global cooldown, grows backoff, summary logging */
+function registerRateLimit() {
+  globalRL.consecutiveHits++;
+  globalRL.successesSinceLastHit = 0;
+  globalRL.windowHitCount++;
+
+  // Stronger backoff: doubling, max 64x (was 32x).
+  // At 64x the cooldown is ~32s+ per hit.
+  globalRL.backoffMultiplier = Math.min(globalRL.backoffMultiplier * 2, 64);
+
+  // Cooldown proportional to backoff, with jitter
+  const cooldownMs = globalRL.backoffMultiplier * 500 + Math.random() * 500;
+  globalRL.cooldownUntil = Math.max(globalRL.cooldownUntil, Date.now() + cooldownMs);
+
+  // Hard pause: if many consecutive 429s, set a long cooldown floor
+  if (globalRL.consecutiveHits >= 10) {
+    const hardPauseMs = Math.min(globalRL.consecutiveHits * 5_000, 120_000); // up to 2 min
+    globalRL.cooldownUntil = Math.max(globalRL.cooldownUntil, Date.now() + hardPauseMs);
+  }
+
+  // Summary logging: aggregate into one line per 60s window
+  const now = Date.now();
+  if (now - globalRL.lastSummaryLogTime >= globalRL.logWindowMs) {
+    const windowSec = Math.round((now - globalRL.windowStart) / 1000);
+    log('HL', `rate-limited x${globalRL.windowHitCount} in last ${windowSec}s | backoff=x${globalRL.backoffMultiplier} | cooldown=${Math.round((globalRL.cooldownUntil - now) / 1000)}s | consecutive=${globalRL.consecutiveHits}`);
+    globalRL.lastSummaryLogTime = now;
+    globalRL.windowHitCount = 0;
+    globalRL.windowStart = now;
+  }
+}
+
+/** Register a successful HL call — gradually ramps down backoff */
+function registerSuccess() {
+  globalRL.consecutiveHits = 0;
+  globalRL.successesSinceLastHit++;
+  // Slow ramp-down: only reduce after 5 consecutive successes, and by only 10%
+  // (was 25% per success — caused instant return to full speed after cooldown)
+  if (globalRL.backoffMultiplier > 1 && globalRL.successesSinceLastHit >= 5) {
+    globalRL.backoffMultiplier = Math.max(globalRL.backoffMultiplier * 0.9, 1);
+    globalRL.successesSinceLastHit = 0; // reset counter for next batch of 5
+  }
+}
+
+/** Wait if we're in a global cooldown period */
+async function waitForCooldown() {
+  const remaining = globalRL.cooldownUntil - Date.now();
+  if (remaining > 0) {
+    await sleep(remaining);
+  }
+}
+
+/** True if system is in a high-backoff state (used by pollers to self-throttle) */
+function isUnderPressure() {
+  return globalRL.backoffMultiplier >= 4 || Date.now() < globalRL.cooldownUntil;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Hyperliquid REST helper with retry + 429 handling
 // ─────────────────────────────────────────────────────────────
 
 async function hlPost(body, retries = 3, timeoutMs = 15_000) {
+  // Respect global cooldown before any attempt
+  await waitForCooldown();
+
   for (let attempt = 0; attempt < retries; attempt++) {
+    // Under high backoff, reduce retries to 1 to avoid piling on
+    if (attempt > 0 && isUnderPressure()) {
+      throw new Error('Skipping retry — system under rate-limit pressure');
+    }
+
     try {
       metrics.apiCalls++;
       const controller = new AbortController();
@@ -125,12 +213,17 @@ async function hlPost(body, retries = 3, timeoutMs = 15_000) {
       clearTimeout(timer);
 
       if (res.status === 429) {
-        const delay = Math.pow(3, attempt) * 500 + Math.random() * 300;
-        log('HL', `Rate limited (429), retry in ${Math.round(delay)}ms`);
-        await sleep(delay);
+        registerRateLimit();
+        // Don't immediately retry on 429 — wait full cooldown
+        if (attempt < retries - 1) {
+          await waitForCooldown();
+          // Extra inter-retry pause scaled by backoff
+          await sleep(Math.min(globalRL.backoffMultiplier * 200, 5_000));
+        }
         continue;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      registerSuccess();
       return await res.json();
     } catch (err) {
       metrics.apiErrors++;
@@ -138,7 +231,7 @@ async function hlPost(body, retries = 3, timeoutMs = 15_000) {
         log('HL', `Request timeout (attempt ${attempt + 1}/${retries})`);
       }
       if (attempt === retries - 1) throw err;
-      await sleep(Math.pow(2, attempt) * 1_000);
+      await sleep(Math.pow(2, attempt) * 1_000 + globalRL.backoffMultiplier * 100);
     }
   }
 }
@@ -324,6 +417,9 @@ async function handleWSMessage(msg) {
 // ─────────────────────────────────────────────────────────────
 
 async function pollMarketData() {
+  // Skip if in global cooldown or under significant backoff pressure
+  if (Date.now() < globalRL.cooldownUntil) return;
+  if (isUnderPressure()) return;
   try {
     const data = await hlPost({ type: 'metaAndAssetCtxs' });
     if (!data || !Array.isArray(data) || data.length < 2) return;
@@ -372,6 +468,9 @@ async function pollMarketData() {
 // ─────────────────────────────────────────────────────────────
 
 async function pollDexNames() {
+  // Skip if in global cooldown or under significant backoff pressure
+  if (Date.now() < globalRL.cooldownUntil) return;
+  if (isUnderPressure()) return;
   try {
     // First check Redis — if still cached, skip the API call
     const cached = await redisGet('dex_names');
@@ -440,12 +539,27 @@ async function pollLiquidations() {
 // HIP-3 Batch Position Fetching
 // ─────────────────────────────────────────────────────────────
 
-// Simple concurrency limiter for parallel HL calls
-async function parallelLimit(tasks, limit) {
+// Concurrency limiter with staggered starts and pressure awareness
+async function parallelLimit(tasks, limit, staggerMs = 0) {
   const results = [];
   const executing = new Set();
 
-  for (const task of tasks) {
+  for (let i = 0; i < tasks.length; i++) {
+    // Under pressure, reduce concurrency to 2 and increase stagger
+    const effectiveLimit = isUnderPressure() ? Math.min(limit, 2) : limit;
+    const effectiveStagger = isUnderPressure() ? Math.max(staggerMs, 500) : staggerMs;
+
+    // Stagger: wait between task starts to avoid burst
+    if (i > 0 && effectiveStagger > 0) {
+      await sleep(effectiveStagger);
+    }
+
+    // If system entered hard cooldown mid-batch, wait it out
+    if (Date.now() < globalRL.cooldownUntil) {
+      await waitForCooldown();
+    }
+
+    const task = tasks[i];
     const p = task().then(
       (val) => ({ status: 'fulfilled', value: val }),
       (err) => ({ status: 'rejected',  reason: err }),
@@ -455,7 +569,7 @@ async function parallelLimit(tasks, limit) {
     const clean = () => executing.delete(p);
     p.then(clean, clean);
 
-    if (executing.size >= limit) {
+    if (executing.size >= effectiveLimit) {
       await Promise.race(executing);
     }
   }
@@ -484,14 +598,16 @@ async function fetchHIP3Positions(address, dexes) {
     return { positions: [], dexStates: {}, timestamp: Date.now(), cached: false, error: 'no_dexes' };
   }
 
-  // Fetch all clearinghouseState in parallel (capped concurrency)
+  // Fetch all clearinghouseState with capped concurrency + stagger.
+  // Under pressure: reduced concurrency (2) + wider stagger (500ms)
+  // to avoid burst of calls that all 429 simultaneously.
   const tasks = dexList.map(dex => () =>
     hlPost({ type: 'clearinghouseState', user: address, dex }, 2, 10_000)
       .then(state => ({ dex, state, ok: true }))
       .catch(err => ({ dex, state: null, ok: false, error: err.message }))
   );
 
-  const results = await parallelLimit(tasks, MAX_HIP3_CONCURRENT);
+  const results = await parallelLimit(tasks, MAX_HIP3_CONCURRENT, HIP3_STAGGER_MS);
 
   const positions = [];
   const dexStates = {};
@@ -755,6 +871,11 @@ app.get('/metrics', (_req, res) => {
     cached_dex_count: cachedDexNames.length,
     prices_count:     Object.keys(latestPrices).length,
     memory_mb:        Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    rate_limit_backoff: globalRL.backoffMultiplier,
+    rate_limit_cooldown_remaining_ms: Math.max(0, globalRL.cooldownUntil - Date.now()),
+    rate_limit_consecutive_429s: globalRL.consecutiveHits,
+    rate_limit_window_hits: globalRL.windowHitCount,
+    rate_limit_under_pressure: isUnderPressure(),
   });
 });
 
@@ -796,17 +917,19 @@ async function start() {
   // 2. Connect WebSocket to Hyperliquid
   connectWebSocket();
 
-  // 3. Initial data fetch (sequential to avoid rate-limit on startup)
+  // 3. Initial data fetch (sequential with generous gaps to avoid 429 burst)
   log('Boot', 'Fetching initial data...');
   await pollDexNames();
-  await sleep(200); // Small gap to avoid 429
+  await sleep(1_000);
   await pollMarketData();
-  await sleep(200);
+  await sleep(1_000);
   pollLiquidations(); // Fire and forget — non-critical
 
-  // 4. Start polling loops
+  // 4. Start polling loops (stagger start times to avoid simultaneous firing)
   marketInterval = setInterval(pollMarketData,   MARKET_POLL_MS);
+  await sleep(5_000);
   dexInterval    = setInterval(pollDexNames,     DEX_POLL_MS);
+  await sleep(3_000);
   liqInterval    = setInterval(pollLiquidations, LIQ_POLL_MS);
 
   // 5. Start HTTP server
