@@ -67,8 +67,6 @@ final class WalletManager: ObservableObject {
     @Published var errorMessage: String?
 
     // Account balances / state (refreshed after connect)
-    // Cached in UserDefaults to prevent 0-flash on app launch
-    @Published var accountValue: Double = UserDefaults.standard.double(forKey: "cached_accountValue")
     @Published var perpValue: Double = UserDefaults.standard.double(forKey: "cached_perpValue")
     @Published var spotValue: Double = UserDefaults.standard.double(forKey: "cached_spotValue")
     @Published var perpWithdrawable: Double = 0  // Available margin for perp trading
@@ -85,10 +83,38 @@ final class WalletManager: ObservableObject {
     @Published var evmHypeBalance: Double = 0  // HYPE on HyperEVM (needs transfer to Core)
     @Published var stakingTier: StakingTier = .none
 
-    /// True while a balance fetch is in-flight after an account switch.
-    @Published var isBalanceLoading: Bool = false
-    /// The address that the current accountValue belongs to.
-    var accountValueAddress: String?
+    /// Per-address balance cache. Values persist across account switches so
+    /// revisiting an account shows its last known balance instantly.
+    var accountValueCache: [String: Double] = [:]
+
+    /// accountValue — reads from the per-address cache for the current address.
+    /// Stored as @Published so SwiftUI views update when it changes.
+    @Published var accountValue: Double = UserDefaults.standard.double(forKey: "cached_accountValue")
+
+    /// Write accountValue for a specific address into the per-address cache,
+    /// and update the @Published accountValue if this is the active address.
+    private func setAccountValue(_ value: Double, for address: String) {
+        let key = address.lowercased()
+        accountValueCache[key] = value
+        print("[CACHE-WRITE] addr=\(key.prefix(10))… value=\(value)")
+        // Update @Published if this write is for the currently active address
+        if let current = connectedWallet?.address.lowercased(), current == key {
+            accountValue = value
+            print("[CACHE-READ] addr=\(current.prefix(10))… accountValue=\(value)")
+        }
+    }
+
+    /// Sync @Published accountValue from the per-address cache for the current wallet.
+    /// Call this after switching connectedWallet so UI shows the cached value instantly.
+    private func syncAccountValueFromCache() {
+        guard let addr = connectedWallet?.address.lowercased() else {
+            // No wallet connected — don't reset to 0 (keep last value for animation)
+            return
+        }
+        let cached = accountValueCache[addr] ?? 0
+        accountValue = cached
+        print("[CACHE-SYNC] addr=\(addr.prefix(10))… cached=\(cached)")
+    }
 
     /// Cached sub-account API response for instant display in Settings.
     /// Key: master address, Value: raw JSON array from subAccounts API.
@@ -702,9 +728,8 @@ final class WalletManager: ObservableObject {
     func disconnect() {
         connectedWallet = nil
         UserDefaults.standard.removeObject(forKey: walletKey)
+        accountValueCache.removeAll()
         accountValue = 0
-        accountValueAddress = nil
-        isBalanceLoading = false
         perpValue    = 0
         spotValue    = 0
         dailyPnl     = 0
@@ -1134,10 +1159,9 @@ final class WalletManager: ObservableObject {
         if let oldAddr = connectedWallet?.address {
             WebSocketManager.shared.unsubscribeWebData2(address: oldAddr)
         }
-        // Mark balance as loading — HomeView will show a placeholder until the new
-        // fetch completes, preventing both flicker-to-$0 and stale cross-account values.
-        isBalanceLoading = true
         // Clear position/token state (belongs to the old account).
+        // accountValue is NOT cleared — per-address cache keeps the last known value
+        // for each address, so switching back shows the cached value instantly.
         mainDexPositions = []
         hip3Positions = []
         activePositions = []
@@ -1149,6 +1173,7 @@ final class WalletManager: ObservableObject {
         // Reset so subscribeToSpotBalanceWS re-subscribes for the new address
         webData2Subscribed = false
         connectedWallet = wallet
+        syncAccountValueFromCache()   // Instantly show cached balance for the new address
         isPortfolioMargin = cachedIsPortfolioMargin(for: address) ?? false
         // Don't persist to UserDefaults — sub-account switch is temporary
         // WebSocket subscription happens inside refreshAccountState → subscribeToSpotBalanceWS
@@ -1410,8 +1435,8 @@ final class WalletManager: ObservableObject {
                 if let avh = entry["accountValueHistory"] as? [Any],
                    let lastPair = avh.last as? [Any],
                    lastPair.count >= 2 {
-                    if let d = lastPair[1] as? Double { accountValue = d; accountValueAddress = refreshAddress; gotPortfolioValue = true }
-                    else if let s = lastPair[1] as? String, let d = Double(s) { accountValue = d; accountValueAddress = refreshAddress; gotPortfolioValue = true }
+                    if let d = lastPair[1] as? Double { setAccountValue(d, for: refreshAddress); gotPortfolioValue = true }
+                    else if let s = lastPair[1] as? String, let d = Double(s) { setAccountValue(d, for: refreshAddress); gotPortfolioValue = true }
                 }
                 if let pnlHistory = entry["pnlHistory"] as? [Any],
                    let lastPair = pnlHistory.last as? [Any],
@@ -1427,7 +1452,6 @@ final class WalletManager: ObservableObject {
                 print("[BALANCE] ⚠️ Portfolio API empty for \(refreshAddress.prefix(10))…, keeping previous value")
             }
 
-            isBalanceLoading = false
             print("[BALANCE] sub-account \(refreshAddress.prefix(10))… accountValue=\(accountValue) (portfolio=\(gotPortfolioValue))")
             UserDefaults.standard.set(perpValue, forKey: "cached_perpValue")
             UserDefaults.standard.set(spotValue, forKey: "cached_spotValue")
@@ -1438,7 +1462,7 @@ final class WalletManager: ObservableObject {
         // Use backend /wallet/:address — one request, backend handles HL API rate limits
         let backendURL = URL(string: "\(Self.backendBaseURL)/wallet/\(address)")!
         var req = URLRequest(url: backendURL)
-req.timeoutInterval = 15
+req.timeoutInterval = 5
 
 do {
     let (data, _) = try await URLSession.shared.data(for: req)
@@ -1541,8 +1565,8 @@ do {
                 if let avh = entry["accountValueHistory"] as? [Any],
                    let lastPair = avh.last as? [Any],
                    lastPair.count >= 2 {
-                    if let d = lastPair[1] as? Double { accountValue = d; accountValueAddress = refreshAddress }
-                    else if let s = lastPair[1] as? String, let d = Double(s) { accountValue = d; accountValueAddress = refreshAddress }
+                    if let d = lastPair[1] as? Double { setAccountValue(d, for: refreshAddress) }
+                    else if let s = lastPair[1] as? String, let d = Double(s) { setAccountValue(d, for: refreshAddress) }
                 }
                 // Daily PnL
                 if let pnlHistory = entry["pnlHistory"] as? [Any],
@@ -1557,7 +1581,6 @@ do {
             // Portfolio API failed — keep previous accountValue, do NOT recompute from formula.
             print("[BALANCE] ⚠️ Portfolio API failed: \(error.localizedDescription), keeping previous value")
         }
-        isBalanceLoading = false
         print("[BALANCE] accountValue=\(accountValue) perpValue=\(perpValue) spotValue=\(spotValue)")
 
         // Persist — always save, including zero balances (so stale cache gets cleared)
@@ -1676,7 +1699,7 @@ do {
     private static let spotSession: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.httpMaximumConnectionsPerHost = 2
-        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForRequest = 4
         return URLSession(configuration: config)
     }()
 
@@ -1854,6 +1877,7 @@ do {
         webData2Subscribed = false
 
         connectedWallet = wallet
+        syncAccountValueFromCache()   // Instantly show cached balance (if revisiting)
         isPortfolioMargin = cachedIsPortfolioMargin(for: wallet.address) ?? false
         if let data = try? JSONEncoder().encode(wallet) {
             UserDefaults.standard.set(data, forKey: walletKey)
@@ -1874,8 +1898,11 @@ do {
               let wallet = try? JSONDecoder().decode(ConnectedWallet.self, from: data)
         else { return }
         connectedWallet = wallet
-        // Cached accountValue from UserDefaults belongs to this saved wallet
-        accountValueAddress = wallet.address
+        // Seed per-address cache from UserDefaults so balance shows instantly on launch
+        let cachedAV = UserDefaults.standard.double(forKey: "cached_accountValue")
+        if cachedAV > 0 {
+            setAccountValue(cachedAV, for: wallet.address)
+        }
         // Refresh balances on app launch (fetchAbstractionMode is called inside)
         Task {
             await refreshAccountState()

@@ -372,12 +372,6 @@ struct HomeView: View {
             if isPhantomActive { return phantomBalance }
             return wallet.accountValue
         }()
-        // Show "--" if the stored accountValue belongs to a different address
-        let balanceStale: Bool = {
-            if isPhantomActive { return false }
-            guard let current = wallet.connectedWallet?.address else { return false }
-            return wallet.accountValueAddress != current
-        }()
         let pnl     = isPhantomActive ? phantomPnl : wallet.dailyPnl
         let denom   = balance - pnl
         let pnlPct  = denom != 0 ? (pnl / denom) * 100 : 0
@@ -419,26 +413,18 @@ struct HomeView: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(Color(white: 0.5))
 
-                if balanceStale {
-                    Text("--")
-                        .font(.system(size: 28, weight: .bold, design: .rounded))
-                        .foregroundColor(Color(white: 0.3))
-                } else {
-                    Text(formatUSD(balance))
-                        .font(.system(size: 28, weight: .bold, design: .rounded))
-                        .foregroundColor(.white)
-                }
+                Text(formatUSD(balance))
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
 
                 // Daily PnL
-                if !balanceStale {
-                    HStack(spacing: 4) {
-                        Text("PNL (24h) :")
-                        Text(pnl >= 0 ? "+\(formatUSD(pnl))" : formatUSD(pnl))
-                        Text("(\(String(format: "%+.2f%%", pnlPct)))")
-                    }
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(pnl >= 0 ? .hlGreen : .red)
+                HStack(spacing: 4) {
+                    Text("PNL (24h) :")
+                    Text(pnl >= 0 ? "+\(formatUSD(pnl))" : formatUSD(pnl))
+                    Text("(\(String(format: "%+.2f%%", pnlPct)))")
                 }
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(pnl >= 0 ? .hlGreen : .red)
             }
 
             // Action buttons

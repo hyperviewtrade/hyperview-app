@@ -549,7 +549,7 @@ struct SettingsView: View {
         await MainActor.run { isLoadingSubAccounts = subAccounts.isEmpty }
 
         guard let url = URL(string: "https://api.hyperliquid.xyz/info") else { return }
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: 4)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
@@ -577,40 +577,71 @@ struct SettingsView: View {
             subInfos.append((name: name, address: subAddr, isPM: isPM))
         }
 
-        // Fetch portfolio API for each sub-account — the SAME source WalletView uses.
-        // This is the only reliable way to get the correct Account Value for all account types.
-        var portfolioValues: [String: Double] = [:]  // address → accountValue
+        // Phase 1: Show cached balances INSTANTLY (no network)
+        var portfolioValues: [String: Double] = [:]
+        for info in subInfos {
+            if let cached = walletMgr.accountValueCache[info.address.lowercased()] {
+                portfolioValues[info.address.lowercased()] = cached
+            }
+        }
+
+        // Build initial list with cached values — show immediately
+        var parsed: [SubAccountInfo] = subInfos.map { info in
+            let balance = portfolioValues[info.address.lowercased()]
+            return SubAccountInfo(
+                name: info.name,
+                address: info.address,
+                balance: balance.map { String(format: "$%.2f", $0) } ?? "Loading…",
+                isPortfolioMargin: info.isPM
+            )
+        }
+        await MainActor.run {
+            subAccounts = parsed
+            if masterAddress == nil { masterAddress = walletMgr.savedMasterAddress ?? wallet.address }
+            isLoadingSubAccounts = false
+        }
+
+        // Phase 2: Fetch fresh values in background (batches of 3), update progressively
+        let allInfos = subInfos  // fetch ALL fresh, not just uncached — ensures accuracy
         await withTaskGroup(of: (String, Double?).self) { group in
-            for info in subInfos {
+            let maxConcurrent = 3
+            var idx = 0
+            for _ in 0..<min(maxConcurrent, allInfos.count) {
+                let info = allInfos[idx]; idx += 1
                 group.addTask {
                     let val = await Self.fetchPortfolioAccountValue(address: info.address)
                     return (info.address, val)
                 }
             }
             for await (addr, val) in group {
-                if let v = val { portfolioValues[addr.lowercased()] = v }
+                if let v = val {
+                    portfolioValues[addr.lowercased()] = v
+                    // Update cache + UI progressively as each result arrives
+                    let addrLower = addr.lowercased()
+                    await MainActor.run {
+                        WalletManager.shared.accountValueCache[addrLower] = v
+                        if let i = parsed.firstIndex(where: { $0.address.lowercased() == addrLower }) {
+                            parsed[i] = SubAccountInfo(
+                                name: parsed[i].name,
+                                address: parsed[i].address,
+                                balance: String(format: "$%.2f", v),
+                                isPortfolioMargin: parsed[i].isPortfolioMargin
+                            )
+                            subAccounts = parsed
+                        }
+                    }
+                }
+                if idx < allInfos.count {
+                    let info = allInfos[idx]; idx += 1
+                    group.addTask {
+                        let val = await Self.fetchPortfolioAccountValue(address: info.address)
+                        return (info.address, val)
+                    }
+                }
             }
         }
 
-        var parsed: [SubAccountInfo] = []
-        for info in subInfos {
-            let balance = portfolioValues[info.address.lowercased()] ?? 0
-            print("[SETTINGS] Sub '\(info.name)' addr=\(info.address.prefix(10))… balance=\(balance) (from portfolio API)")
-
-            parsed.append(SubAccountInfo(
-                name: info.name,
-                address: info.address,
-                balance: String(format: "$%.2f", balance),
-                isPortfolioMargin: info.isPM
-            ))
-        }
-
         print("[SETTINGS] loadSubAccounts complete: \(parsed.count) subs via portfolio API")
-        await MainActor.run {
-            subAccounts = parsed
-            if masterAddress == nil { masterAddress = walletMgr.savedMasterAddress ?? wallet.address }
-            isLoadingSubAccounts = false
-        }
     }
 
     /// Quick parse of cached sub-account JSON — shows names and addresses instantly,

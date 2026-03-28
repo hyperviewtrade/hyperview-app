@@ -77,8 +77,8 @@ final class HyperliquidAPI {
 
     private init() {
         let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest  = 15
-        cfg.timeoutIntervalForResource = 30
+        cfg.timeoutIntervalForRequest  = 5
+        cfg.timeoutIntervalForResource = 15
         session = URLSession(configuration: cfg, delegate: pinningDelegate, delegateQueue: nil)
     }
 
@@ -230,30 +230,82 @@ final class HyperliquidAPI {
 
     /// Fetches daily candle open prices from backend (1 request for all markets).
     /// Returns { "BTC": 67500.0, "ETH": 3200.0, "cash:INTC": 22.5, ... }
+    /// Fetch 1d candle open for every coin directly from Hyperliquid candleSnapshot.
+    /// This is the SAME source as the chart, ensuring 24h change matches exactly.
     func fetchDailyOpens() async -> [String: Double] {
-        guard let url = URL(string: "\(Self.backendBaseURL)/daily-opens") else { return [:] }
+        // Collect all coin names from meta
+        let coins: [String]
         do {
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 8
-            let (data, _) = try await session.data(for: req)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let opens = json["opens"] as? [String: Any]
+            let metaData = try await post(body: ["type": "meta"])
+            guard let meta = try JSONSerialization.jsonObject(with: metaData) as? [String: Any],
+                  let universe = meta["universe"] as? [[String: Any]]
             else { return [:] }
-
-            var result: [String: Double] = [:]
-            for (coin, val) in opens {
-                if let d = val as? Double {
-                    result[coin] = d
-                } else if let n = val as? NSNumber {
-                    result[coin] = n.doubleValue
-                }
-            }
-            print("📊 Backend daily opens: \(result.count) markets")
-            return result
+            coins = universe.compactMap { $0["name"] as? String }
         } catch {
-            print("⚠️ Daily opens fetch failed: \(error.localizedDescription)")
+            print("⚠️ Daily opens: meta fetch failed: \(error)")
             return [:]
         }
+        guard !coins.isEmpty else { return [:] }
+
+        let endMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let startMs = endMs - 172_800_000 // 2 days back to guarantee at least 1 daily candle
+        let url = URL(string: "https://api.hyperliquid.xyz/info")!
+
+        // Fetch in parallel with concurrency limit to avoid overwhelming the API
+        let result = await withTaskGroup(of: (String, Double?).self, returning: [String: Double].self) { group in
+            let maxConcurrent = 5
+            var idx = 0
+            var opens: [String: Double] = [:]
+
+            // Seed initial batch
+            for _ in 0..<min(maxConcurrent, coins.count) {
+                let coin = coins[idx]; idx += 1
+                group.addTask {
+                    let body: [String: Any] = ["type": "candleSnapshot", "req": [
+                        "coin": coin, "interval": "1d", "startTime": startMs, "endTime": endMs
+                    ]]
+                    guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return (coin, nil) }
+                    var req = URLRequest(url: url, timeoutInterval: 3)
+                    req.httpMethod = "POST"
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.httpBody = bodyData
+                    guard let (data, _) = try? await URLSession.shared.data(for: req),
+                          let candles = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+                          let last = candles.last,
+                          let openStr = last["o"] as? String,
+                          let open = Double(openStr), open > 0
+                    else { return (coin, nil) }
+                    return (coin, open)
+                }
+            }
+
+            for await (coin, open) in group {
+                if let o = open { opens[coin] = o }
+                if idx < coins.count {
+                    let coin = coins[idx]; idx += 1
+                    group.addTask {
+                        let body: [String: Any] = ["type": "candleSnapshot", "req": [
+                            "coin": coin, "interval": "1d", "startTime": startMs, "endTime": endMs
+                        ]]
+                        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return (coin, nil) }
+                        var req = URLRequest(url: url, timeoutInterval: 3)
+                        req.httpMethod = "POST"
+                        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                        req.httpBody = bodyData
+                        guard let (data, _) = try? await URLSession.shared.data(for: req),
+                              let candles = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+                              let last = candles.last,
+                              let openStr = last["o"] as? String,
+                              let open = Double(openStr), open > 0
+                        else { return (coin, nil) }
+                        return (coin, open)
+                    }
+                }
+            }
+            return opens
+        }
+        print("📊 Daily opens from candles: \(result.count)/\(coins.count) markets")
+        return result
     }
 
     // MARK: - Perp markets (main + HIP-3)
@@ -662,7 +714,7 @@ final class HyperliquidAPI {
     /// Fetches portfolio history (account value, PnL, volume) for all timeframes.
     /// Returns raw array of [period, data] tuples.
     func fetchPortfolio(address: String) async throws -> [[String: Any]] {
-        let data = try await post(body: ["type": "portfolio", "user": address])
+        let data = try await post(body: ["type": "portfolio", "user": address], maxRetries: 1)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [Any] else {
             throw APIError.parseError("portfolio")
         }

@@ -121,11 +121,6 @@ struct ChartContainerView: View {
     private var priceStrip: some View {
         let lastPrice = chartVM.livePrice
         let candles   = chartVM.candles
-        let periodChange: Double = {
-            guard let last = candles.last, last.open != 0 else { return 0 }
-            return ((last.close - last.open) / last.open) * 100
-        }()
-        let isPos = periodChange >= 0
         let priceColor = candles.last.map { $0.isGreen ? Color.hlGreen : Color.tradingRed } ?? .white
 
         return HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -134,15 +129,6 @@ struct ChartContainerView: View {
                 .foregroundColor(priceColor)
                 .contentTransition(.numericText())
                 .animation(.easeInOut(duration: 0.15), value: lastPrice)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(String(format: "%@%.2f%%", isPos ? "+" : "", periodChange))
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(isPos ? .hlGreen : .tradingRed)
-                Text(chartVM.selectedInterval.rawValue)
-                    .font(.system(size: 10))
-                    .foregroundColor(.gray)
-            }
 
             Spacer()
 
